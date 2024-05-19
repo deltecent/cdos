@@ -1,0 +1,3021 @@
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0001
+XMODEM 2.05 by Martin Eberhard
+
+                  0002  ;======================================================
+                  0003  ;XMODEM file transfer program for Cromemco CDOS 2.X
+                  0004  ;running on a 4 MHz Z-80, communicating via either
+                  0005  ;serial port of a Cromenco TU-ART, or via the console
+                  0006  ;port of a Cromemco 4FDC/16FDC/64FDC disk controller
+                  0007  ;
+                  0008  ;Assemble with Cromemco's "ASMB" CDOS Z-80 Macro
+                  0009  ;Assembler or SLR Systems "Z80ASM" CP/M Z-80 Macro
+                  0010  ;assembler.
+                  0011  ;
+                  0012  ;Thanks to Ward Christensen for inventing XMODEM and
+                  0013  ;keeping it simple. Thanks to John Byrns for the
+                  0014  ;XMODEM-CRC extension. Thanks to Keith Petersen, W8SDZ,
+                  0015  ;for a few ideas I borrowed from his XMODEM.ASM V3.2
+                  0016  ;
+                  0017  ;See help message near the end of this code for usage.
+                  0018  ;======================================================
+                  0019  ;REVISION HISTORY
+                  0020  ;1.xx 06 NOV 2012 M.Eberhard
+                  0021  ;  Created & debugged
+                  0022  ;2.00 03 NOV 2017 M. Eberhard
+                  0023  ;  Rewrite, carry a lot over from CP/M XMODEM  2.7, to
+                  0024  ;  speed up transmit/receive and improve user interface
+                  0025  ;2.01 26 Feb 2019 M. Eberhard
+                  0026  ;  Finish the job on 2.00
+                  0027  ;2.02 5 March 2019 M. Eberhard
+                  0028  ;  Add K command and set the default to 32k. This is
+                  0029  ;  needed because of slow disk writes, causing the
+                  0030  ;  sender to timeout waiting for CDOS to write.
+                  0031  ;2.03 10 March 2019 M. Eberhard
+                  0032  ;  Interleave occasional receiving/sending Xmodem
+                  0033  ;  blocks with writing to/reading from disk, to prevent
+                  0034  ;  the Xmodem sender/receiver from timing out during
+                  0035  ;  slow disk accesses. Add more ^C opportunities.
+                  0036  ;2.04 09 April 2019  M. Eberhard
+                  0037  ;  Also support file transfer via the console port.
+                  0038  ;  Add Quiet mode option (needed for console transfers).
+                  0039  ;  Support received CAN chr to cancel session. Send CAN
+                  0040  ;  chr when aborting while receiving, EOT when aborting
+                  0041  ;  while sending. Cleaner aborts.
+                  0042  ;2.05 13 May 2024 P. Linstruth
+                  0043  ;  Fixed problem with /TB command line option.
+                  0044  ;
+                  0045  ;PROGRAM NOTES
+                  0046  ;
+                  0047  ;The XModem spec calls for a sender to time out after
+                  0048  ;10 seconds if it does not receive the ACK after
+                  0049  ;sending a complete block. XMODEM.COM holds off the
+                  0050  ;sender while it writes to disk by waiting to send the
+                  0051  ;ACK for the most recent packet. CDOS is pretty slow
+                  0052  ;when writing to double-density floppy disks (probably
+                  0053  ;because of its blocking/deblocking algorithm). To
+                  0054  ;prevent the sender from timing out while Xmodem writes
+                  0055  ;to disk, XMODEM.COM receives an occasional Xmodem
+                  0056  ;block while it is performing disk writes. To stay
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0002
+XMODEM 2.05 by Martin Eberhard
+
+                  0057  ;within the 10-second timeout spec, WBPERX should be
+                  0058  ;no larger than about 40. (Hyperterminal is happy with
+                  0059  ;a value of 64.) CDOS is much faster at reading from
+                  0060  ;disk, so RBPERX can be higher or even disabled. (See
+                  0061  ;options below.)
+                  0062  ;
+                  0063  ;XMODEM.COM assumes that the console port is already
+                  0064  ;set up, and that its baud rate will not change if it
+                  0065  ;is selected as the transfer port. Transferring via
+                  0066  ;the console port uses dirtect access to the hardware
+                  0067  ;(as opposed to using CDOS calls) because CDOS strips
+                  0068  ;the parity bit on received console characters. This
+                  0069  ;code implicitly assumes the console port's base
+                  0070  ;address is 00, and it works the same as the TU-ART.
+                  0071  ;
+                  0072  ;All code that is only used during initialization is at
+                  0073  ;the end, and gets overwritten by the data buffer.
+                  0074  ;
+                  0075  ;The position of the CRC calculation table (CRCTAB) is
+                  0076  ;forced to be on a 256-byte page boundary. Subroutines
+                  0077  ;have been shoved around to minimize the number of
+                  0078  ;wasted bytes before this table.
+                  0079  ;
+                  0080  ;This code implicitly assumes that Xmodem blocks are
+                  0081  ;the same size as CDOS disk records - 128 bytes each.
+                  0082  ;
+                  0083  ;Z-80 alternate register usage:
+                  0084  ; b'= scratch
+                  0085  ; c'= base address of the selected TU-ART channel
+                  0086  ; de'= scratch
+                  0087  ; hl'= Xmodem record count
+                  0088  ;======================================================
+                  0089  ;---------------------------
+                  0090  ;This code's revision number
+                  0091  ;---------------------------
+      (0205)      0092  VERS	equ	0205h	;high byte = major rev number
+                  0093  			;low byte = minor version
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0003
+XMODEM 2.05 by Martin Eberhard
+System Equates
+
+                  0096  ;---------------
+                  0097  ;Program Options
+                  0098  ;---------------
+      (0008)      0099  DEFBAUD	equ	8	;default baud rate (38.4K)
+                  0100  			;(See BAUDTB at the end)
+                  0101  
+      (0001)      0102  DEFCHK	equ	1	;default error-checking mode
+                  0103  			;0=checksum, 1=CRC
+                  0104  
+      (0041)      0105  DEFPORT	equ	'A'	;default TU-ART serial port:
+                  0106  			;'A'=port A, 'B'=port B
+                  0107  
+      (000A)      0108  ERRLIM	equ	10	;Max Xmodem error-retries
+                  0109  			;(10 is standard)
+                  0110  
+      (003F)      0111  DEFBSIZ	equ	63	;default buffer size (kbytes)
+                  0112  			;(Uses the smaller of this
+                  0113  			;and "all available RAM")
+                  0114  
+      (000A)      0115  CRSTAL	equ	10	;delay (in seconds) before
+                  0116  			;..receiving when the console
+                  0117  			;..is the transfer port
+                  0118  
+                  0119  ;The following 2 parameters exist to prevent the
+                  0120  ;sender/receiver on the other end of the serial
+                  0121  ;port from timing out while we do disk accesses.
+                  0122  ;See PROGRAM NOTES above.
+                  0123  
+      (0040)      0124  WBPERX	equ	64	;# of 128-byte disk records to
+                  0125  			;write before requesting
+                  0126  			;another Xmodem block (max=256)
+                  0127  
+      (0101)      0128  RBPERX	equ	257	;Max # of 128-byte disk records
+                  0129  			;to read before sending another
+                  0130  			;Xmodem block.
+                  0131  			;>256 disables this feature
+                  0132  
+                  0133  ;Timeout values in seconds
+                  0134  
+      (000A)      0135  SOHTO	equ	10	;sender to send SOH 
+      (005A)      0136  NAKTO	equ	90	;receiver to send initial NAK
+      (003C)      0137  ACKTO	equ	60	;receiver to ACK (or NAK)
+                  0138  			;(time to write to disk)
+                  0139  
+      (0080)      0140  BLKSIZ	equ	128	;bytes per Xmodem block
+                  0141  			;-->Must be 128<--
+                  0142  
+                  0143  ;Progress pacifiers printed on the console
+                  0144  
+      (002B)      0145  PACACK	equ	'+'	;Received an ACK
+      (002D)      0146  PACNAK	equ	'-'	;Received a NAK
+      (0040)      0147  PACLIN	equ	64	;pacifiers per line
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0004
+XMODEM 2.05 by Martin Eberhard
+System Equates
+
+                  0149  ;----------------
+                  0150  ;CDOS 2.X Equates
+                  0151  ;----------------
+      (0080)      0152  RECSIZ	equ	128	;bytes per disk record
+                  0153  			;(assumed to be same as BLKSIZ)
+                  0154  
+                  0155  ;CDOS Function Codes
+                  0156  
+      (0001)      0157  CONINF	equ	1	;Read Console, result in a
+      (0002)      0158  CONOTF	equ	2	;Write e to Console
+      (0009)      0159  PRINTF	equ	9	;Print $-terminated line at de
+      (000A)      0160  ILINEF	equ	10	;input buffered line
+      (000B)      0161  CONSTF	equ	11	;Console input status
+                  0162  			;a=-1 if chr, 0 if none
+      (000F)      0163  OPENF	equ	15	;Open disk file, FCB at de
+                  0164  			;a=-1 if not found
+      (0010)      0165  CLOSEF	equ	16	;Close disk file, FCB at de
+                  0166  			;a=-1 if not found
+      (0011)      0167  SRCHF	equ	17	;Search dir for file, FCB at de
+                  0168  			;A=-1 if not found
+      (0013)      0169  DELETF	equ	19	;delete file, FCB at (de)
+      (0014)      0170  READF	equ	20	;Read next record. 0=OK, 1=EOF
+      (0015)      0171  WRITEF	equ	21	;Write record, 0=OK, 1=ERR,
+                  0172  			;2=out of disk space, 
+                  0173  			;0FFH=NO DIR SPC
+      (0016)      0174  CREATF	equ	22	;Create file, 0FFH=BAD
+      (001A)      0175  STDMAF	equ	26	;Set disk buffer to (de)
+                  0176  
+                  0177  ;CDOS addresses
+                  0178  
+      (0000)      0179  CDOSRE	equ	00h	;CDOS Reentry (code assumes 0)
+      (0005)      0180  CDOS	equ	05h	;CDOS System Call
+      (0006)      0181  CDOSA	equ	CDOS+1	;address of CDOS
+      (005C)      0182  FCB	equ	5CH	;CDOS file control blk
+      (005C)      0183  FCBDD	equ	 FCB	 ;Drive Descriptor
+      (005D)      0184  FCBFN	equ	 FCB+1	 ;File name (8 chrs)
+      (0065)      0185  FCBFT	equ	 FCB+9	 ;File Type (3 chrs)
+      (0068)      0186  FCBEXT	equ	 FCB+12	 ;File extent within FCB
+      (006B)      0187  FCBRCNT	equ	 FCB+15	 ;Record cnt within FCB
+      (007C)      0188  FCBREC	equ	 FCB+32	 ;Record # within FCB
+      (0080)      0189  COMBUF	equ	80H	;disk & cmd line buffer
+      (0100)      0190  USAREA	equ	100H	;User program area
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0005
+XMODEM 2.05 by Martin Eberhard
+System Equates
+
+                  0192  ;--------------
+                  0193  ;TU-ART Equates
+                  0194  ;--------------
+      (0020)      0195  TUARTA	equ	20H	;Base of TU-ART serial port A
+      (0050)      0196  TUARTB	equ	50H	;Base of TU-ART serial port B
+                  0197  
+                  0198  ;Register offsets from base address
+                  0199  
+      (0000)      0200  TUSTAT	equ	00h	;Status input port
+                  0201  			;(code asumes 0)
+      (0001)      0202  TUFE	equ	  01h	  ;framing error
+      (0040)      0203  TURBF	equ	  40h	  ;Rx-buf full bit
+      (0080)      0204  TUTBA	equ	  80h	  ;Tx-buf available bit
+      (0007)      0205  TUTBAB	equ	  7	  ;TUTBA bit
+                  0206  
+      (0000)      0207  TUBAUD	equ	00h	;baud rate output port
+                  0208  
+      (0001)      0209  TUDATA	equ	01h	;Data I/O port
+                  0210  
+      (0002)      0211  TUCTRL	equ	02h	;Control output port
+      (0001)      0212  TURST	equ	  01h	  ;Reset UART
+      (0010)      0213  TUHBD	equ	  10h	  ;high baud rate
+                  0214  
+      (0003)      0215  TUINTE	equ	03h	;Int enable I/O port
+                  0216  ;-------------------------------------
+                  0217  ;4FDC/16FDC/64FDC Console Port Equates
+                  0218  ;(Much like the TU-ART.)
+                  0219  ;-------------------------------------
+      (0000)      0220  FDC16S	equ	00h	;Base of xxFDC UART
+                  0221  			;(Code in CCTRLC assumes 0)
+                  0222  
+                  0223  ;Register offsets from base address
+                  0224  
+      (0000)      0225  FSSTAT	equ	00h	;Status Input
+                  0226  
+      (0001)      0227  FSFE	equ	  01h	  ;framing error
+      (0040)      0228  FSRBF	equ	  40h	  ;Rx-buf full bit
+      (0080)      0229  FSTBA	equ	  80h	  ;Tx-buf available bit
+      (0007)      0230  FSTBAB	equ	  7	  ;FSTBA bit
+                  0231  
+      (0000)      0232  FSBAUD	equ	00h	;Baud Rate Output
+                  0233  
+      (0001)      0234  FSDATA	equ	01h	;Data I/O
+                  0235  
+      (0002)      0236  FSCMD	equ	02h	;Command output port
+      (0001)      0237  FSRST	equ	  01h	  ;Reset UART
+      (0010)      0238  FSHBD	equ	  10h	  ;high baud rate
+                  0239  
+      (0003)      0240  FSINTE	equ	03h	;Int mask output port
+                  0241  ;-----
+                  0242  ;ASCII
+                  0243  ;-----
+      (0001)      0244  SOH	equ	1	;Start of Xmodem block
+      (0003)      0245  CTRLC	equ	3	;^C (user-abort)
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0006
+XMODEM 2.05 by Martin Eberhard
+System Equates
+
+      (0004)      0246  EOT	equ	4	;End Xmodem session
+      (0006)      0247  ACK	equ	6	;Xmodem block ack
+      (000A)      0248  LF	equ	0Ah
+      (000D)      0249  CR	equ	0Dh
+      (0015)      0250  NAK	equ	15h	;Xmodem block negative ACK
+      (0018)      0251  CAN	equ	18h	;Xmodem Cancel
+      (0043)      0252  SELCRC	equ	'C'	;selects CRC mode at init
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0007
+XMODEM 2.05 by Martin Eberhard
+Main Code
+
+                  0255  ;==================================================
+                  0256  ;Initialize, using code that gets wiped out by the
+                  0257  ;BUFFER. INIT will jump to either TXFILE or RXFILE,
+                  0258  ;if there are no errors during initialization.
+                  0259  ;==================================================
+      (0100)      0260  	ORG	USAREA
+0100  C30507      0261  	jp	INIT
+                  0262  ;-------------------------------------------------
+                  0263  ;Local stack. This will overflow onto the jp INIT
+                  0264  ;and then into the top of the command line buffer.
+                  0265  ;-------------------------------------------------
+0103  0000        0266  	dw	0,0,0
+      0000 
+      0000 
+                  0267  STACK:
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0008
+XMODEM 2.05 by Martin Eberhard
+Main Transmit Xmodem File Routine
+
+                  0270  ;*****Function*****************************
+                  0271  ;Send a CDOS disk file in Xmodem format
+                  0272  ;On Entry:
+                  0273  ;  c'= status port address
+                  0274  ;  hl'= 0 (Xmodem record count)
+                  0275  ;  iy = WAITNK (RXBYTE error return address)
+                  0276  ;  FCB is valid
+                  0277  ;  BUFCNT=0
+                  0278  ;  BUFMAX = last BUFFER address-127
+                  0279  ;  CRCFLG = 0FFh (uninitialized state)
+                  0280  ;  PACCNT = 0FFh if quiet mode, 0 otherwise
+                  0281  ;  Disk file is open for reading
+                  0282  ;  Initial NAK or SELRC has already been sent
+                  0283  ;Throughout this code:
+                  0284  ;  c'= status port address
+                  0285  ;  hl'= 16-bit Xmodem record count
+                  0286  ;  ix = DMA address
+                  0287  ;  iy = timeout-error address for RXBYTE
+                  0288  ;******************************************
+                  0289  ;-----------------------------------------------
+                  0290  ;Initial BUFFER fill, while the disk is still
+                  0291  ;spinning from loading XMODEM.COM. CRCFLG=FF
+                  0292  ;prevents interleaved Xmodem block transmission.
+                  0293  ;-----------------------------------------------
+0109  CD2506      0294  TXFILE:	call	FILBUF	;Fill BUFFER from disk, returns
+                  0295  			;..ix=address for next Tx block
+                  0296  
+010C  CDFA03      0297  	call	ILPRNT
+010F  53656E64    0298  	db	'Sending',' '+80h
+                  0299  ;--------------------------------------------------
+                  0300  ;Get the error-checking mode: Wait for the initial
+                  0301  ;NAK or SELCRC from the receiver. NAK means we
+                  0302  ;use checksums, and SELCRC means we use CRC-16.
+                  0303  ;Abort if too many bogus characters or after a long
+                  0304  ;timeout (both set by NAKTO) or if the user types
+                  0305  ;^C. Report the error checking mode on the console
+                  0306  ;unless quiet mode is selected.
+                  0307  ; PACCNT = 0FFh if quiet mode, 0 otherwise
+                  0308  ;--------------------------------------------------
+0117  210007      0309  	ld	hl,PACCNT
+011A  7E          0310  	ld	a,(hl)		;FFh means quiet
+011B  2F          0311  	cpl			;00 means quiet
+011C  57          0312  	ld	d,a		;FFh otherwise
+                  0313  
+011D  065A        0314  	ld	b,NAKTO		;Long time/bogus count
+011F  23          0315  	inc	hl		;hl=CRCFLG
+0120  34          0316  	inc	(hl)		;CRCFLG=0
+                  0317  
+0121  CD0006      0318  GTMODE:	call	RXBYT1		;timeout to WAITNK
+                  0319  
+0124  FE43        0320  	cp	a,SELCRC	;'C' for CRC?
+0126  2819        0321  	jr	Z,GPCRC	 	;yes:message, done
+                  0322  
+0128  FE15        0323  	cp	a,NAK		;NAK for checksum?
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0009
+XMODEM 2.05 by Martin Eberhard
+Main Transmit Xmodem File Routine
+
+012A  281A        0324  	jr	Z,GPCKSM	;yes:message, done
+                  0325  
+012C  10F3        0326  WAITNK:	djnz	GTMODE		;timeout yet?
+                  0327  
+                  0328  ;Timeout or too many bogus characters: abort
+                  0329  
+012E  CDB301      0330  	call	CABORT
+0131  4E6F2072    0331  	db 'No receiver ini','t'+80h
+                  0332  
+                  0333  ;Got a SELCRC. Announce unless quiet,
+                  0334  ;then go send the file.
+                  0335  ; d = 0 if quiet mode, FFh otherwise
+                  0336  
+0141  14          0337  GPCRC:	inc	d		;quiet mode?
+0142  CCC806      0338  	call	Z,PCRC		;print unless quiet
+0145  34          0339  	inc	(hl)		;CRCFLG=1
+                  0340  				;d>=0 here
+                  0341  
+                  0342  ;Got a NAK. Announce unless quiet,
+                  0343  ;then go send the file.
+                  0344  ; d = FFh if not quiet mode and not CRC mode
+                  0345  
+0146  14          0346  GPCKSM:	inc	d		;quiet mode?
+0147  CCD506      0347  	call	Z,PCKSUM	;print unless CRC or
+                  0348  				;..quiet mode
+                  0349  
+                  0350  ;------------------------------------------------
+                  0351  ;Loop to transmit the entire disk file as Xmodem
+                  0352  ;blocks. Whenever the BUFFER is empty, refill it
+                  0353  ;from disk and test for EOF. Exit via FILBUF once
+                  0354  ;we have read the entire disk file and the BUFFER
+                  0355  ;is empty.
+                  0356  ; ix = DMA pointer for Tx from the BUFFER
+                  0357  ;------------------------------------------------
+014A  FD21D203    0358  	ld	iy,ACKERR   ;RXBYT1 Timeout address
+                  0359  
+014E  2AFA06      0360  TXLOOP:	ld	hl,(BUFCNT) ;block count in BUFFER
+0151  7C          0361  	ld	a,h
+0152  B5          0362  	or	a,l
+0153  CC2506      0363  	call	Z,FILBUF    ;Empty? go refill from disk
+                  0364  			    ;Returns ix=BUFFER
+                  0365  			    ;..and hl=BUFCNT,
+                  0366  			    ;exit if no more data
+                  0367  
+                  0368  			    ;hl=(BUFCNT)
+0156  CD4A02      0369  	call	TXBLK	    ;transmit 1 block from (ix)
+                  0370  
+0159  18F3        0371   	jr	TXLOOP
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0010
+XMODEM 2.05 by Martin Eberhard
+Main Receive Xmodem File Routine
+
+                  0374  ;***Function*******************************
+                  0375  ;Receive an Xmodem file & save it to disk
+                  0376  ;-->Entry is at RXFILE<--
+                  0377  ;On Entry:
+                  0378  ;  c'= status port base address
+                  0379  ;  hl'=0 (Xmodem block count)
+                  0380  ;  ix = BUFFER address
+                  0381  ;  iy = RXBERR (timeout return address)
+                  0382  ;  carry is clear
+                  0383  ;  FCB is valid
+                  0384  ;  Disk file has been created and is open
+                  0385  ;  initial NACK or SELCRC has been sent
+                  0386  ;  BUFCNT = 0
+                  0387  ;  BUFMAX = last BUFFER address+1
+                  0388  ;  EOFLAG = 0
+                  0389  ;  PACCNT = 0FFh if quiet mode, 0 otherwise
+                  0390  ;Throughout this code:
+                  0391  ;  c'= status port address
+                  0392  ;  hl'= 16-bit record count
+                  0393  ;  ix = current Rx DMA address
+                  0394  ;  iy = timeout-error address for RXBYTE
+                  0395  ;******************************************
+015B  3AFE06      0396  RXLOOP:	ld	a,(EOFLAG) ;Has the sender finished?
+015E  87          0397  	add	a,a	   ;msb means EOT received
+                  0398  
+015F  D4B302      0399  	call	NC,TXACK   ;ACK the previous block
+                  0400  			   ;(does not affect carry)
+                  0401  ;------------------------
+                  0402  ;Routine Entry
+                  0403  ;(Carry cleared on entry)
+                  0404  ;------------------------
+0162  D40E03      0405  RXFILE:	call	NC,RXBLK   ;go receive 1 block
+                  0406  			   ;Carry means BUFFER is full
+                  0407  			   ;or EOT or CAN
+                  0408  
+0165  DCDD01      0409  RFLUSH:	call	C,FLUSH	   ;flush if full
+                  0410  			   ;carry set if none written
+0168  30F1        0411  	jr	NC,RXLOOP  ;get another, until full
+                  0412  
+                  0413  ;FLUSH returned with carry set: success
+                  0414  
+016A  CDF703      0415  	call	CILPRT	   ;Success message
+016D  4FCB        0416  	db	'O','K'+80h
+                  0417  
+                  0418  ;Fall into RXEND to close the file and report
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0011
+XMODEM 2.05 by Martin Eberhard
+Main Receive Xmodem File Routine
+
+                  0420  ;***Exit*************************************
+                  0421  ;Close the disk file. If no record were ever
+                  0422  ;written to disk, then delete the empty file.
+                  0423  ;Otherwise, print the number of Xmodem blocks
+                  0424  ;received, and return to CDOS.
+                  0425  ;On Entry:
+                  0426  ;  hl'= Xmodem block count
+                  0427  ;  XMODE<7> set if we ever wrote to disk
+                  0428  ;********************************************
+016F  0E10        0429  RXEND:	ld	c,CLOSEF	;CDOS CLOSE FILE func
+0171  CDF103      0430  	call	CDOSFC
+0174  3C          0431  	inc	a		;-1 means close error
+0175  CA7606      0432  	jp	Z,CFAIL
+                  0433  
+0178  3AFF06      0434  	ld	a,(XMODE)	;did we ever write?
+017B  87          0435  	add	a,a		;msb set means yes
+017C  381B        0436  	jr	C,RRXCNT	;y: report blks Rx'd
+                  0437  
+017E  CDEF03      0438  	call	FDELET		;n: delete empty file
+                  0439  
+0181  3C          0440  	inc	a		;successful delete?
+0182  2815        0441  	jr	Z,RRXCNT	;n: print 0 byte file
+                  0442  
+0184  CD4202      0443  	call	CMSGXT		;succesful deletion
+0187  456D7074    0444  	db	'Empty file delete','d'+80h
+                  0445  
+0199  CDF703      0446  RRXCNT:	call	CILPRT
+019C  52656365    0447  	db	'Received',' '+80h
+                  0448  
+                  0449  ;Fall into REPCNT
+                  0450  
+                  0451  ;***Exit****************************************
+                  0452  ;Report 16-bit block count, return to CDOS
+                  0453  ;On Entry:
+                  0454  ;  hl'= Xmodem block count 
+                  0455  ;  either 'sent ' or 'received ' already printed
+                  0456  ;***********************************************
+01A5  D9          0457  REPCNT:	exx			;hl has block count
+01A6  CD9D06      0458  	call	PDEC16		;block count in decimal
+                  0459  
+01A9  CD4502      0460  	call	MSGXIT		;print & return to CDOS
+01AC  20626C6F    0461  	db	' block','s'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0012
+XMODEM 2.05 by Martin Eberhard
+Aborts
+
+                  0464  ;***Exit****************************************
+                  0465  ;Cancel and Abort - if receiving, send a CAN.
+                  0466  ;If sending, send an EOT. Then tidy up and quit.
+                  0467  ;On Entry:
+                  0468  ; top-of-stack = address of MSB-terminated
+                  0469  ;     message to print after 'Abort: '
+                  0470  ; XMODE = 00h if sending
+                  0471  ;       = X1h if receiving and not flushing
+                  0472  ;       = X2h if flushing when ^C came
+                  0473  ;       = 8Xh if we have ever written to disk
+                  0474  ;***********************************************
+01B3  3AFF06      0475  CABORT:	ld	a,(XMODE) ;Sending or receiving?
+01B6  5F          0476  	ld	e,a	  ;remember for ABORT
+01B7  B7          0477  	or	a,a	  ;0 means sending
+                  0478  
+01B8  3E18        0479  	ld	a,CAN
+01BA  2002        0480  	jr	NZ,CAB1
+01BC  3E04        0481  	ld	a,EOT
+                  0482  
+01BE  CDB502      0483  CAB1:	call	TXBYTE
+                  0484  
+                  0485  ;Fall into ABORT
+                  0486  
+                  0487  ;***Exit*****************************************
+                  0488  ;Abort - close the file if writing, delete it
+                  0489  ;if no blocks have been written to disk yet.
+                  0490  ;On Entry:
+                  0491  ; top-of-stack = address of MSB-terminated
+                  0492  ;     message to print after 'Abort: '
+                  0493  ; e = XMODE = 00h if sending
+                  0494  ;           = X1h if receiving and not flushing
+                  0495  ;           = X2h if flushing when ^C came
+                  0496  ;           = 8Xh if we have ever written to disk
+                  0497  ;************************************************
+01C1  CDF703      0498  ABORT:	call	CILPRT
+01C4  41424F52    0499  	db	'ABORT:',' '+80h
+                  0500  
+01CB  E1          0501  	pop	hl	  ;Exit message address
+01CC  CDE706      0502  	call	HLPRNT
+                  0503  
+01CF  7B          0504  	ld	a,e	  ;Sending or receiving?
+01D0  B7          0505  	or	a,a	  ;0 means sending
+01D1  2876        0506  	jr	Z,EXIT	  ;Sending: we are done
+                  0507  
+                  0508  ;We were receiving an Xmodem file. Flush the
+                  0509  ;BUFFER unless we were already flushing when
+                  0510  ;we got the ^C from the user
+                  0511  ; a = XMODE value <> 0
+                  0512  
+01D3  32FE06      0513  	ld (EOFLAG),a     ;NZ to prevent interleaved Rx
+                  0514  			  ;XMODE msb set if we were
+                  0515  			  ;..writing when ^C came
+01D6  E602        0516  	and	02h	  ;were we already flushing?
+01D8  CCDD01      0517  	call	Z,FLUSH
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0013
+XMODEM 2.05 by Martin Eberhard
+Aborts
+
+                  0518  
+01DB  1892        0519  	jr	RXEND
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0014
+XMODEM 2.05 by Martin Eberhard
+Buffer Flush to Disk Subroutine
+
+                  0522  ;***Subroutine*************************************
+                  0523  ;Flush the buffer to disk, with interleaved receipt
+                  0524  ;of Xmodem block to prevent sender timeout
+                  0525  ;On Entry:
+                  0526  ;  BUFCNT = number of blocks in the buffer
+                  0527  ;  XMODE = 01 if no disk writes yet
+                  0528  ;        = 81 if disk writes have ever occured
+                  0529  ;  EOFLAG <> 0 if EOF has been received
+                  0530  ;On Exit:
+                  0531  ;  BUFCNT = number of new blocks in the buffer
+                  0532  ;  ix = address if next open buffer slot
+                  0533  ;  EOFLAG set if we've received the Xmodem EOT
+                  0534  ;  XMODE = 81h if disk writes have occured
+                  0535  ;  Carry set if no blocks were written
+                  0536  ;Trashes a,bc,de,hl
+                  0537  ;**************************************************
+01DD  2AFA06      0538  FLUSH:	ld	hl,(BUFCNT) ;disk records in the BUFFER
+01E0  7D          0539  	ld	a,l	    ;Anything to flush?
+01E1  B4          0540  	or	a,h
+01E2  37          0541  	scf		    ;carry, since empty
+01E3  C8          0542  	ret	Z
+                  0543  
+01E4  3E82        0544  	ld	a,82h	   ;remember we are flushing
+01E6  32FF06      0545  	ld	(XMODE),a
+                  0546  
+01E9  EB          0547  	ex	de,hl	    ;de gets disk record count
+                  0548  
+01EA  210000      0549  	ld	hl,0	    ;ready to count blocks
+01ED  22FA06      0550  	ld	(BUFCNT),hl ;Received during disk write
+                  0551  
+01F0  210207      0552  	ld	hl,BUFFER   ;beginning of disk data
+01F3  DD210207    0553  	ld	ix,BUFFER   ;reset Receive DMA pointer
+                  0554  
+                  0555  ;-----------------------------------------------------
+                  0556  ;Loop to write all blocks in the BUFFER to disk. Every
+                  0557  ;WBPERX disk writes, stop to receive one Xmodem block,
+                  0558  ;often enough that the sender does not time out. Put
+                  0559  ;out. (Stop doing this once we receive an Xmodem EOT.)
+                  0560  ;the new blocks in the beginning of the BUFFER, where
+                  0561  ;it's already been cleared it out by writing to disk.
+                  0562  ;This code assumes that disk records are the same size
+                  0563  ;as Xmodem blocks, 128 bytes each.
+                  0564  ; b = WBPERX count-down of received xmodem blocks
+                  0565  ;     (to prevent timeout)
+                  0566  ; de = number of BUFFER records to write to disk
+                  0567  ; hl = pointer for data to write to disk
+                  0568  ; ix = DMA address for new received Xmodem blocks
+                  0569  ; BUFCNT counts new Xmodem received blocks
+                  0570  ; XMODE = 82h (we will write, currently flushing)
+                  0571  ;-----------------------------------------------------
+01F7  0640        0572  WFLP0:	ld	b,WBPERX and 0FFh ;Reset modulo counter
+                  0573  
+                  0574  ;Check for ^C, with XMODE=82, indicating that the ^C
+                  0575  ;occured during flush (meaning that the abort routine
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0015
+XMODEM 2.05 by Martin Eberhard
+Buffer Flush to Disk Subroutine
+
+                  0576  ;should not attempt to flush the buffer).
+                  0577  
+01F9  CDC202      0578  	call	CCTRLC		;User abort? trashes c
+                  0579  	
+01FC  7A          0580  WFLOOP:	ld	a,d		;de=write record cnt
+01FD  B3          0581  	or	a,e		;any more to send?
+                  0582  
+01FE  2006        0583  	jr	NZ,WFLP1	;y:keep flushing
+                  0584  
+0200  3E81        0585  	ld	a,81h		;n:no longer flushing
+0202  32FF06      0586  	ld	(XMODE),a
+0205  C9          0587  	ret			;done, Carry clear
+                  0588  WFLP1:
+                  0589  
+                  0590  ;Write a disk record at hl to disk
+                  0591  
+0206  D5          0592  	push	de		;disk record count
+                  0593  
+0207  54          0594  	ld	d,h
+0208  5D          0595  	ld	e,l		;de = DMA address
+0209  0E1A        0596  	ld	c,STDMAF	;CDOS SET DMA function
+020B  CD0500      0597  	call	CDOS
+                  0598  
+020E  0E15        0599  	ld	c,WRITEF	;Write from buf to disk
+0210  CDF103      0600  	call	CDOSFC
+                  0601  
+0213  118000      0602  	ld	de,RECSIZ	;disk record size
+0216  19          0603  	add	hl,de		;hl=next record address
+                  0604  
+0217  D1          0605  	pop	de		;disk record count
+                  0606  
+0218  B7          0607  	or	a,a		;CDOS returns 0 if okay
+0219  2015        0608  	jr	NZ,DWERR	;Disk write error?
+                  0609  
+021B  1B          0610  	dec	de		;1 more record written
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0016
+XMODEM 2.05 by Martin Eberhard
+Buffer Flush to Disk Subroutine
+
+                  0612  ;-------------------------------------------------
+                  0613  ;Bump write record modulo counter (in b), and go
+                  0614  ;receive an Xmodem block if it reached 0, and if
+                  0615  ;we have not yet received the EOT.
+                  0616  ;Within RXBLK
+                  0617  ; ix = DMA address for new received Xmodem blocks
+                  0618  ; BUFCNT counts new received Xmodem blocks
+                  0619  ; EOFLAG <> 0 if we've received the Xmodem EOT
+                  0620  ; XMODE = 82h (writes occured, currently flushing)
+                  0621  ;-------------------------------------------------
+021C  10DE        0622  	djnz	WFLOOP		;enough disk records
+                  0623  				;since the last RX?
+                  0624  
+021E  3AFE06      0625  	ld	a,(EOFLAG)	;Has sender finished?
+0221  B7          0626  	or	a,a
+0222  20D3        0627  	jr	NZ,WFLP0	;Y: no more to receive
+                  0628  
+0224  E5          0629  	push	hl		;disk write pointer
+0225  D5          0630  	push	de		;write record count
+                  0631  
+0226  CDB302      0632  	call	TXACK		;ACK previous block
+0229  CD0E03      0633  	call	RXBLK		;get 1 more block
+                  0634  				;(will never be full)
+022C  D1          0635  	pop	de		;write record count
+022D  E1          0636  	pop	hl		;disk write pointer
+022E  18C7        0637  	jr	WFLP0		;write next disk record
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0017
+XMODEM 2.05 by Martin Eberhard
+Program Exits
+
+                  0640  ;***Exit************
+                  0641  ;Abort on disk error
+                  0642  ;*******************
+0230  CDB301      0643  DWERR:	call	CABORT		;cancel & abort
+0233  4469736B    0644  	db	'Disk write fai','l'+80h
+                  0645  ;***Exit*********************************************
+                  0646  ;Print CRLF, then MSB-terminated string following the
+                  0647  ;call. Fix everything for CDOS, and return to CDOS
+                  0648  ;****************************************************
+0242  CDAD02      0649  CMSGXT:	call	PCRLF
+                  0650  
+                  0651  ;Fall into MSGXIT
+                  0652  
+                  0653  ;***Exit****************************************
+                  0654  ;Print msb-terminated string following the call,
+                  0655  ;fix everything for CDOS, and return to CDOS
+                  0656  ;***********************************************
+0245  E1          0657  MSGXIT:	pop	hl		;point to string
+0246  CDE706      0658  	call	HLPRNT
+                  0659  
+                  0660  ;Fall into EXIT
+                  0661  
+                  0662  ;***Exit*******
+                  0663  ;Return to CDOS
+                  0664  ;**************
+0249  C7          0665  EXIT:	RST	0		;CDOS reentry at 0000h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0018
+XMODEM 2.05 by Martin Eberhard
+Send one Xmodem Block Subroutine
+
+                  0668  ;***Subroutine****************************
+                  0669  ;Transmit one Xmodem block with Retries
+                  0670  ;On Entry:
+                  0671  ;  BUFCNT = number of blocks in BUFFER > 0
+                  0672  ;  hl = (BUFCNT)
+                  0673  ;  ix = address of next block to send
+                  0674  ;  hl'= block number
+                  0675  ;On Exit:
+                  0676  ;  ix = address of next block to send
+                  0677  ;  BUFCNT has been decremented
+                  0678  ;Trashes af,bc,de,hl
+                  0679  ;****************************************
+024A  2B          0680  TXBLK:	dec	hl		;one fewer block in
+024B  22FA06      0681  	ld	(BUFCNT),hl	;..the BUFFER
+                  0682  
+024E  3E0B        0683  	ld	a,ERRLIM+1	;reset error count
+0250  32F806      0684  	ld	(ERRCNT),a
+                  0685  
+0253  D9          0686  	exx			;inc 16-bit block count
+0254  23          0687  	inc	hl		;..in alt reg pair hl'
+0255  D9          0688  	exx
+                  0689  ;---------------------------------------------
+                  0690  ;Send the block header: SOH, 8-bit Block
+                  0691  ;number, Complimented 8-bit block number
+                  0692  ;(This is the Block send retry re-entry point)
+                  0693  ;---------------------------------------------
+0256  3E01        0694  TXRTRY:	ld	a,SOH		;SOH first
+0258  CDB502      0695  	call	TXBYTE
+                  0696  
+025B  D9          0697  	exx			;hl'=16-bit block count
+025C  7D          0698  	ld	a,l		;8-bit block number
+025D  D9          0699  	exx
+025E  CDB502      0700  	call	TXBYTE		;(preserves a)
+                  0701  
+0261  2F          0702  	cpl			;complimented block #
+0262  CDB502      0703  	call	TXBYTE
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0019
+XMODEM 2.05 by Martin Eberhard
+Send one Xmodem Block Subroutine
+
+                  0705  ;-----------------------------------
+                  0706  ;Send the next block from the BUFFER
+                  0707  ;On Entry:
+                  0708  ;  ix = block address in the BUFFER
+                  0709  ;On Exit:
+                  0710  ;  Data checksum is in c
+                  0711  ;  16-bit data CRC is in de
+                  0712  ;  ix = ix+128
+                  0713  ;-----------------------------------
+0265  010080      0714  	ld	bc,BLKSIZ*256+0	;b=bytes/block,
+                  0715  				;...clear cksum in C
+0268  51          0716  	ld	d,c		;clear 16-bit CRC
+0269  59          0717  	ld	e,c		;..in de
+                  0718  
+026A  DD7E00      0719  TXBLUP:	ld	a,(ix)		;Get a data byte
+026D  CDB502      0720  	call	TXBYTE		;..and Send it
+                  0721  ;-----------------------------------------------------
+                  0722  ;Update the 16-bit CRC and 8-bit checksum with one
+                  0723  ;more data byte. For speed, this code assumes that the
+                  0724  ;CRC table is on a page boundary, and that the table
+                  0725  ;is split, with the high bytes in the first half and
+                  0726  ;the low bytes in the second half. (Inline for speed)
+                  0727  ; a = byte just transmitted
+                  0728  ; c = checksum so far
+                  0729  ; de = CRC so far
+                  0730  ;-----------------------------------------------------
+0270  2604        0731  	ld	h,CRCTAB/256	;Table addr high byte
+                  0732  
+0272  AA          0733  	xor	a,d		;compute lookup address
+0273  6F          0734  	ld	l,a		;low byte of lookup
+                  0735  
+0274  AA          0736  	xor	a,d		;recover original byte
+0275  81          0737  	add	a,c		;update checksum too
+0276  4F          0738  	ld	c,a
+                  0739  
+0277  7E          0740  	ld	a,(hl)		;compute CRC high byte
+0278  AB          0741  	xor	a,e		;..using the table
+0279  57          0742  	ld	d,a
+                  0743  
+027A  24          0744  	inc	h		;low bytes are in the
+027B  5E          0745  	ld	e,(hl)		;..other half of table
+                  0746  ;----------------------------
+                  0747  ;CRC is done. Next data byte,
+                  0748  ;unless we have sent them all
+                  0749  ;----------------------------
+027C  DD23        0750  	inc	ix		;Next byte
+027E  10EA        0751  	djnz	TXBLUP		;loop through block
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0020
+XMODEM 2.05 by Martin Eberhard
+Send one Xmodem Block Subroutine
+
+                  0753  ;--------------------------------------------
+                  0754  ;Send checksum or 16-bit CRC, based on CRCFLG
+                  0755  ; c = 8-bit checksum
+                  0756  ; de = CRC16
+                  0757  ; CRCFLG<>0 if CRC mode enabled
+                  0758  ;--------------------------------------------
+0280  3A0107      0759  	ld	a,(CRCFLG)	;Checksum or CRC?
+0283  B7          0760  	or	a,a
+0284  2805        0761  	jr	Z,TXCKSM	;jump to send checksum
+                  0762  
+0286  7A          0763  	ld	a,d		;send d
+0287  CDB502      0764  	call	TXBYTE
+028A  4B          0765  	ld	c,e		;now the 2nd CRC byte
+                  0766  
+028B  79          0767  TXCKSM:	ld	a,c		;cksum or CRC 2nd byte 
+028C  CDB502      0768  	call	TXBYTE		;send d to modem
+                  0769  ;-------------------------------------------
+                  0770  ;Wait for the ACK. If none arrives by the
+                  0771  ;end of the timeout, or if a NAK is received
+                  0772  ;instead of an ACK, then resend the block.
+                  0773  ;-------------------------------------------
+028F  CDB703      0774  	call	GETACK		;Wait for the ACK
+                  0775  				;Z flag set if ACK
+0292  20C2        0776  	jr	NZ,TXRTRY	;NZ: timeout or NAK
+                  0777  
+                  0778  ;Fall into PACOK to print the pacifier and return
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0021
+XMODEM 2.05 by Martin Eberhard
+Console Pacifier Subroutines
+
+                  0781  ;***Subroutine*************************************
+                  0782  ;Print good pacifier on the console unless disabled
+                  0783  ;On Entry:
+                  0784  ;  PACCNT = pacifier column count-down
+                  0785  ;  if PACCNT=0FFh then quiet mode: no pacifiers
+                  0786  ;On Exit:
+                  0787  ;  PACCNT decremented mod PACLIN, unless quiet mode
+                  0788  ;Trashes af,c,e,hl
+                  0789  ;**************************************************
+0294  1E2B        0790  PACOK:	ld	e,PACACK
+                  0791  
+0296  21          0792  	db	21h	;ld hl opcode skips 2 bytes
+                  0793  
+                  0794  ;Skip into PACIFY
+                  0795  
+                  0796  ;***Subroutine*************************************
+                  0797  ;Print error pacifier on the console unless
+                  0798  ;disabled, giving the user a chance to abort
+                  0799  ;On Entry:
+                  0800  ;  PACCNT = pacifier column count-down
+                  0801  ;  if PACCNT=0FFh then quiet mode: no pacifiers
+                  0802  ;On Exit:
+                  0803  ;  PACCNT decremented mod PACLIN, unless quiet mode
+                  0804  ;Trashes af,c,e,hl
+                  0805  ;**************************************************
+0297  1E2D        0806  PACERR:	ld	e,PACNAK
+                  0807  
+                  0808  ;Fall into PACIFY
+                  0809  
+                  0810  ;***Subroutine*************************************
+                  0811  ;Print pacifier on the console unless disabled, 
+                  0812  ;with opportunity for ^C user abort.
+                  0813  ;Print a CR/LF at the end of every PACLIN columns.
+                  0814  ;On Entry:
+                  0815  ;  e = pacify character
+                  0816  ;  PACCNT = pacifier column count-down
+                  0817  ;  if PACCNT=0FFh then quiet mode: no pacifiers
+                  0818  ;On Exit:
+                  0819  ;  PACCNT decremented mod PACLIN, unless quiet mode
+                  0820  ;Trashes af,c,hl
+                  0821  ;**************************************************
+0299  CDC202      0822  PACIFY:	call	CCTRLC		;user abort? trashes c
+                  0823  
+029C  210007      0824  	ld	hl,PACCNT
+029F  7E          0825  	ld	a,(hl)		;quiet mode?
+02A0  3C          0826  	inc	a
+02A1  C8          0827  	ret	Z		;FF means quiet
+                  0828  
+02A2  35          0829  	dec	(hl)
+02A3  FCAB02      0830  	call	M,PACNL		;need a new line?
+                  0831  
+                  0832  ;fall into PRINTE to print the pacifier chr
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0022
+XMODEM 2.05 by Martin Eberhard
+Console I/O Routines
+
+                  0835  ;***Subroutine******************
+                  0836  ;Print character in e on console
+                  0837  ;trashes c
+                  0838  ;*******************************
+02A6  0E02        0839  PRINTE:	ld	c,CONOTF	;CDOS Console out
+02A8  C30500      0840  	jp	CDOS		;return via CDOS
+                  0841  ;***Subroutine*******
+                  0842  ;Next pacify line
+                  0843  ;On Entry:
+                  0844  ;  hl = PACCNT
+                  0845  ;On Exit:
+                  0846  ;  (hl) = PACLIN-1
+                  0847  ;Trashes af,c
+                  0848  ;********************
+02AB  363F        0849  PACNL:	ld	(hl),PACLIN-1	;pacifier chrs/line
+                  0850  
+                  0851  ;Fall into PCRLF
+                  0852  
+                  0853  ;***Subroutine***
+                  0854  ;Print CR, LF
+                  0855  ;Trashes af,c
+                  0856  ;****************
+02AD  CDFA03      0857  PCRLF:	call	ILPRNT
+02B0  0D8A        0858  	db	CR,LF+80H
+02B2  C9          0859  	ret
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0023
+XMODEM 2.05 by Martin Eberhard
+Console I/O Routines
+
+                  0861  ;***Subroutine***
+                  0862  ;Send ACK
+                  0863  ;Trashes a, b'
+                  0864  ;Z cleared
+                  0865  ;Carry unaffected
+                  0866  ;****************
+02B3  3E06        0867  TXACK:	ld	a,ACK
+                  0868  
+                  0869  ;	fall into TXBYTE
+                  0870  
+                  0871  ;***Subroutine*************
+                  0872  ;Send a to the TU-ART
+                  0873  ;On Entry:
+                  0874  ;  a = byte to send
+                  0875  ;  c'= TU-ART control port
+                  0876  ;Trashes b'
+                  0877  ;Z cleared
+                  0878  ;Carry unaffected
+                  0879  ;**************************
+02B5  D9          0880  TXBYTE:	exx			;alt regs
+                  0881  
+02B6  ED40        0882  TXWAIT:	in	b,(c)		;Get Tx port status
+02B8  CB78        0883  	bit	TUTBAB,b	;Transmit buffer empty?
+02BA  28FA        0884  	jr	Z,TXWAIT	;No: wait
+                  0885  
+02BC  0C          0886  	inc	c		;point to data port
+02BD  ED79        0887  	out	(c),a		;send the byte
+02BF  0D          0888  	dec	c		;back to status port
+                  0889  
+02C0  D9          0890  	exx			;main regs	
+02C1  C9          0891  	ret
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0024
+XMODEM 2.05 by Martin Eberhard
+Console I/O Routines
+
+                  0893  ;***Subroutine*************************************
+                  0894  ;Check for ^C on the console, unless the console is
+                  0895  ;the transfer port. Quit cleanly if ^C received.
+                  0896  ;On Entry:
+                  0897  ;  c' = 0 if the console is the transfer port
+                  0898  ;  XMODE<1>=1 iff called from within FLUSH
+                  0899  ;        (meaning CABORT should not flush)
+                  0900  ;Trashes af,c
+                  0901  ;**************************************************
+02C2  D9          0902  CCTRLC:	exx			;is the console
+02C3  79          0903  	ld	a,c		;..the transfer port?
+02C4  D9          0904  	exx
+02C5  B7          0905  	or	a,a		;console port is at 00
+                  0906  
+02C6  0E0B        0907  	ld	c,CONSTF	;anything on console?
+02C8  C40500      0908  	call	NZ,CDOS
+02CB  3C          0909  	inc	a		;-1 means chr waiting
+                  0910  
+02CC  0E01        0911  	ld	c,CONINF	;read the typed chr
+02CE  CC0500      0912  	call	Z,CDOS		;call if chr waiting
+                  0913  
+02D1  FE03        0914  	cp	a,CTRLC
+02D3  C0          0915  	ret	NZ		;ignore everything else
+                  0916  
+02D4  CDB301      0917  	call	CABORT		;cancel & abort
+02D7  5EC3        0918  	db	'^','C'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0025
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+                  0921  ;----------------------------------------
+                  0922  ;Received something besides an SOH. If
+                  0923  ;it was an EOT or a CAN then send an ACK,
+                  0924  ;set EOFLAG=FFh, and return with carry
+                  0925  ;set. If it was a CAN then say so.
+                  0926  ;----------------------------------------
+02D9  FE18        0927  NOTSOH:	cp	a,CAN		;Cancel?
+02DB  2014        0928  	jr	NZ,CHKEOT
+                  0929  
+02DD  CDF703      0930  	call	CILPRT
+02E0  53656E64    0931  	db	'Sender cancele','d'+80h
+                  0932  
+02EF  3E04        0933  	ld	a,EOT		;act like we got an EOT
+                  0934  				;..so we will FLUSH
+                  0935  
+02F1  D604        0936  CHKEOT:	sub	a,EOT
+02F3  2008        0937  	jr	NZ,PURGE	;unrecognized
+                  0938  				;a=0, carry clear
+                  0939  
+02F5  D1          0940  	pop	de		;chuck the retry addr
+02F6  D601        0941  	sub	a,1		;a=FF, carry set
+02F8  32FE06      0942  	ld	(EOFLAG),a	;FFh means EOT received
+                  0943  
+02FB  18B6        0944  	jr	TXACK		;ACK the EOT and ret
+                  0945  				;..with carry set
+                  0946  
+                  0947  ;------------------------------------------------
+                  0948  ;Not SOH, EOT or CAN. This was an invalid header.
+                  0949  ;Eat the rest of this block (up to 256 received
+                  0950  ;bytes) until the line is quiet for 1 second,
+                  0951  ;which will cause RXBYTE to timeout and jump to
+                  0952  ;the address in iy (which is RXBERR.)
+                  0953  ;------------------------------------------------
+02FD  0600        0954  PURGE:	ld	b,0		;allow 256 babble chrs
+                  0955  
+02FF  CD0006      0956  PRGLUP:	call	RXBYT1		;w/ 1-sec timeout
+0302  10FB        0957  	djnz	PRGLUP		;times out to RXBERR
+                  0958  
+                  0959  ;The transmitter is babbling, unable to synchronize
+                  0960  ;with the incoming data stream. Abort with message.
+                  0961  
+0304  CDB301      0962  	call	CABORT
+0307  4E6F2073    0963  	db	'No syn','c'+80h ;can't find SOH
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0026
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+                  0965  ;***Subroutine**************************************
+                  0966  ;Receive one Xmodem block, with retries
+                  0967  ;On Entry:
+                  0968  ;  c'=status port base address
+                  0969  ;  hl'= Xmodem block count
+                  0970  ;  ix = BUFFER DMA address
+                  0971  ;  iy = RXBERR (error/timeout return address)
+                  0972  ;  BUFCNT = count of received blocks in BUFFER
+                  0973  ;  BUFMAX = last BUFFER address+1
+                  0974  ;  XMODE<1> = 1 iff called from within FLUSH
+                  0975  ;   (meaning CCTRLC should not try to flush)
+                  0976  ;On Exit:
+                  0977  ;  EOFLAG=FFh if EOT encountered
+                  0978  ;  Carry set if BUFFER is full, or if EOT or CAN
+                  0979  ;  hl' incremented if block received
+                  0980  ;  BUFCNT has been incremented if block received
+                  0981  ;  ix points to next BUFFER address
+                  0982  ;  Pacifier has been printed
+                  0983  ;  For a data block, ack has NOT been sent
+                  0984  ;  For an EOT, ACK HAS been sent
+                  0985  ;Trashes a,bc,de,hl
+                  0986  ;Throughout this code:
+                  0987  ;  c'= status port address
+                  0988  ;  hl'= 16-bit record count
+                  0989  ;  ix = Xmodem receive DMA adress
+                  0990  ;  iy = error address for RXBYTE
+                  0991  ;***************************************************
+                  0992  ;---------------------------
+                  0993  ;Receive & validate a block,
+                  0994  ;and see if we got an EOT
+                  0995  ;---------------------------
+030E  3E0B        0996  RXBLK:	ld	a,ERRLIM+1
+0310  32F806      0997  	ld	(ERRCNT),a	;Reset error count
+                  0998  ;---------------------------------------
+                  0999  ;Wait for SOH from the sender to start
+                  1000  ;reception, go investigate anything else
+                  1001  ;(Bad block retry re-entry point)
+                  1002  ;---------------------------------------
+0313  DDE5        1003  RXRTRY:	push	ix		;DMA addr for retry
+                  1004  
+0315  3E14        1005  	ld	a,SOHTO*2	;Timeout for SOH
+0317  CD0206      1006  	call	RXBYTE		;times out to RXBERR
+                  1007  
+031A  FE01        1008  	cp	a,SOH		;Did we get an SOH?
+031C  20BB        1009  	jr	NZ,NOTSOH	;If no, see what we got
+                  1010  ;---------------------------------------------------
+                  1011  ;Got an SOH at beginning of the block. Now get the
+                  1012  ;rest of the block header: 8-bit Block number,
+                  1013  ;followed by the complemented 8-bit block number.
+                  1014  ;Calculate and remember the difference between this
+                  1015  ;block number and the previous block's block number.
+                  1016  ;(We calculate this here because we have the time.)
+                  1017  ;  hl'= Xmodem block count
+                  1018  ;---------------------------------------------------
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0027
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+031E  3E15        1019  	ld	a,NAK		;received at least 1
+0320  32F906      1020  	ld	(NAKCHR),a	;...SOH, so no more 'C'
+0323  CD0006      1021  	call	RXBYT1		;Get block number
+0326  57          1022  	ld	d,a		;Save block number
+                  1023  
+0327  D9          1024  	exx			;8-bit prev. block no.
+0328  95          1025  	sub	a,l		;compute difference
+0329  D9          1026  	exx			;0 means same block
+                  1027  				;1 means next block
+032A  32F706      1028  	ld	(RXBDIF),a	;Save block number dif
+                  1029  
+032D  CD0006      1030  	call	RXBYT1		;compl'd block number
+0330  2F          1031  	cpl			;compliment to compare
+                  1032  
+0331  BA          1033  	cp	a,d
+0332  20C9        1034  	jr	NZ,PURGE	;No match: error
+                  1035  ;-----------------------------------------------------
+                  1036  ;Loop to receive BLKSIZ bytes and store them in the
+                  1037  ;next slot in the BUFFER, computing both the checksum
+                  1038  ;and the CRC along the way. Throughout the RXCHR loop:
+                  1039  ;  b is the byte counter
+                  1040  ;  c accumulates the checksum
+                  1041  ;  de accumulates the CRC-16
+                  1042  ;  ix is the BUFFER memory pointer
+                  1043  ;----------------------------------------------------
+0334  010080      1044  	ld	bc,BLKSIZ*256+0	;b=bytes, c=0 cksum
+0337  51          1045  	ld	d,c		;clear 16-bit CRC too
+0338  59          1046  	ld	e,c
+                  1047  
+0339  CD0006      1048  RXCHR:	call	RXBYT1		;Get one byte of data
+033C  DD7700      1049  	ld	(ix),a		;Store byte in BUFFER
+033F  DD23        1050  	inc	ix		;point to next slot
+                  1051  ;-----------------------------------------------------
+                  1052  ;(Inline for speed: this is the critical path when
+                  1053  ;receiving.) Update the 16-bit CRC and 8-bit checksum
+                  1054  ;with one more data byte. For speed, this code assumes
+                  1055  ;that the CRC table is on a page boundary, and that
+                  1056  ;the table is split, with the high bytes in the first
+                  1057  ;half and the low bytes in the second half.
+                  1058  ; a = newly received byte
+                  1059  ; c = checksum so far
+                  1060  ; de = CRC so far
+                  1061  ;-----------------------------------------------------
+0341  2604        1062  	ld	h,CRCTAB/256	;table addr high byte
+                  1063  
+0343  AA          1064  	xor	a,d		;compute lookup address
+0344  6F          1065  	ld	l,a		;low byte from lookup
+                  1066  
+0345  AA          1067  	xor	a,d		;recover original value
+0346  81          1068  	add	a,c		;update checksum too
+0347  4F          1069  	ld	c,a
+                  1070  
+0348  7E          1071  	ld	a,(hl)		;new CRC high byte
+0349  AB          1072  	xor	a,e		;..using the table
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0028
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+034A  57          1073  	ld	d,a
+                  1074  
+034B  24          1075  	inc	h		;low bytes are in the
+034C  5E          1076  	ld	e,(hl)		;..low 1/2 of the table
+                  1077  ;-----------------------------------------------------
+                  1078  ;Next byte, unless we received all data for this block
+                  1079  ;-----------------------------------------------------
+034D  10EA        1080  	djnz	RXCHR
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0029
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+                  1082  ;------------------------------------------
+                  1083  ;We've received all the block's data bytes.
+                  1084  ;Now verify either the checksum in c or CRC
+                  1085  ;in de, depending on CRCFLG.
+                  1086  ;  b = 0
+                  1087  ;  c = checksum
+                  1088  ;  de = CRC-16
+                  1089  ;  ix = next BUFFER address
+                  1090  ;------------------------------------------
+034F  3A0107      1091  	ld	a,(CRCFLG)	;CRC mode?
+0352  B7          1092  	or	a,a		;0 means cksum
+0353  2806        1093  	jr	Z,RXCKSM
+                  1094  
+0355  CD0006      1095  	call	RXBYT1		;Get 1st byte of CRC
+                  1096  
+0358  AA          1097  	xor	a,d
+0359  47          1098  	ld	b,a		;1st CRC byte result
+                  1099  
+035A  4B          1100  	ld	c,e		;put 2nd CRC byte in C
+                  1101  
+035B  CD0006      1102  RXCKSM:	call	RXBYT1		;2nd CRC byte or cksum
+                  1103  
+035E  A9          1104  	xor	a,c		;cksum/2nd CRC match?
+035F  B0          1105  	or	b		;also the 1st CRC byte
+                  1106  				;clears carry
+0360  201C        1107  	jr	NZ,RXBERR	;No: error
+                  1108  ;---------------------------------------------------
+                  1109  ;Got an error-free block. See if is the block number
+                  1110  ;we expected, based on the prior block's number.
+                  1111  ;  hl=next BUFFER address
+                  1112  ;  RXBDIF = this block's block number minus the
+                  1113  ;    previous block's block number.
+                  1114  ;---------------------------------------------------
+0362  3AF706      1115  	ld	a,(RXBDIF)	;diff between this
+                  1116  				;..block's number & the
+                  1117  				;..prior block's number
+0365  3D          1118  	dec	a
+0366  203A        1119  	jr	NZ,BLKORD	;Not sequential?
+                  1120  ;------------------------------------------------
+                  1121  ;Correct block received. Bump 16-bit BUFFER block
+                  1122  ;count and the 16-bit block number (in hl')
+                  1123  ;------------------------------------------------
+0368  2AFA06      1124  	ld	hl,(BUFCNT)	;BUFFER block count
+036B  23          1125  	inc	hl
+036C  22FA06      1126  	ld	(BUFCNT),hl
+                  1127  		
+036F  D9          1128  	exx			;16-bit Xmodem block #
+0370  23          1129  	inc	hl		;..in hl'
+0371  D9          1130  	exx
+                  1131  ;----------------------------------------
+                  1132  ;Print good-block pacifier on the console
+                  1133  ;----------------------------------------
+0372  CD9402      1134  	call	PACOK
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0030
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+                  1136  ;------------------------------------------------------
+                  1137  ;The retry address value on the stack is the first
+                  1138  ;address of the block we just received. This number
+                  1139  ;plus 256 is the first address beyond where the next
+                  1140  ;block would go. Use this math to see if the next block
+                  1141  ;will fit in the BUFFER, and flush the BUFFER if not.
+                  1142  ;------------------------------------------------------
+0375  D1          1143  	pop	de	    ;1st addr of done block
+0376  14          1144  	inc	d	    ;+256=end of next block+1
+0377  2AFC06      1145  	ld	hl,(BUFMAX) ;max BUFFER address+1
+037A  AF          1146  	xor	a,a	    ;clear carry for sbc
+037B  ED52        1147  	sbc	hl,de	    ;16-bit compare, sets carry
+                  1148  			    ;..if BUFFER is full
+                  1149  
+037D  C9          1150  	ret		    ;w/ result in carry
+                  1151  ;---Receive Error----------------------------------
+                  1152  ;Checksum/CRC error when receiving a file, or PURGE
+                  1153  ;successfully timed out after 1 second. Unless
+                  1154  ;we've seen too many errors on this block, send a
+                  1155  ;NAK to indicate an error. if we are waiting to
+                  1156  ;start and we are in CRC mode (NAKCHR=SELCRC), then
+                  1157  ;send ELCRC instead of NAK.
+                  1158  ;--------------------------------------------------
+037E  DDE1        1159  RXBERR:	pop	ix		;retry DMA address
+0380  CD9702      1160  	call	PACERR		;-pacifier with an
+                  1161  				;..opportunity to abort
+                  1162  
+0383  3AF906      1163  	ld	a,(NAKCHR)	;current NAK chr
+0386  CDB502      1164  	call	TXBYTE
+                  1165  
+                  1166  ;Bump error count, and abort if too many errors.
+                  1167  ;Otherwise, retry the block.
+                  1168  
+0389  21F806      1169  	ld	hl,ERRCNT	;bump error count
+038C  35          1170  	dec	(hl)
+038D  C21303    R 1171  	jp	NZ,RXRTRY	;Retry if not too many
+                  1172  
+0390  CDB301      1173  	call	CABORT		;cancel & abort
+0393  31          1174  	db	[ERRLIM/10]+'0'	;too many block retries
+0394  30          1175  	db	[ERRLIM-[[ERRLIM/10]*10]]+'0'
+0395  20626C6F    1176  	db	' block error','s'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0031
+XMODEM 2.05 by Martin Eberhard
+Receive One Xmodem Block subroutine
+
+                  1178  ;---Receive Error--------------------------------------
+                  1179  ;Non-sequential block received without checksum or CRC
+                  1180  ;error. a=FF if this block has the same block number as
+                  1181  ;the previous block (and should be ignored). Otherwise
+                  1182  ;abort because a block has been irretrievably lost.
+                  1183  ;On Entry:
+                  1184  ;  a = (this block number) - (prior block number) - 1
+                  1185  ;  top-of-stack = starting DMA address of this block
+                  1186  ;On Exit:
+                  1187  ;  ix = retry poointer popped off of stack
+                  1188  ;  Z clear if this was a repeated block
+                  1189  ;  Rude exit to CABORT if not
+                  1190  ;------------------------------------------------------
+03A2  DDE1        1191  BLKORD:	pop	ix		;retry DMA address
+03A4  3C          1192  	inc	a		;was dif-1= FFh?
+03A5  2002        1193  	jr	NZ,BOERR	;n: lost block
+                  1194  
+03A7  3C          1195  	inc	a		;clear Z
+03A8  C9          1196  	ret
+                  1197  
+03A9  CDB301      1198  BOERR:	CALL	CABORT		;cancel & abort
+03AC  4C6F7374    1199  	db	'Lost block','s'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0032
+XMODEM 2.05 by Martin Eberhard
+Xmodem File Transfer Subroutines
+
+                  1202  ;***Subroutine*****************************************
+                  1203  ;Get an ACK from the receiver. If we get a NAK, then
+                  1204  ;print the NAK pacifier on the console. Opportunity for
+                  1205  ;user to abort (with ^C) if timeout waiting for ACK.
+                  1206  ;On Entry:
+                  1207  ;  iy = ACKERR (RXBYTE timeout return address)
+                  1208  ;  c'= port control address
+                  1209  ;On Exit, received an ACK:
+                  1210  ;  Z set and Carry clear
+                  1211  ;On Exit, not an ACK:
+                  1212  ;  Z clear
+                  1213  ;  ix = ix-BLKSIZ
+                  1214  ;  c,e,de,hl trashed
+                  1215  ;If too many errors, abort
+                  1216  ;Trashes a
+                  1217  ;******************************************************
+                  1218  ;-----------------------------------------
+                  1219  ;Get a received byte, or timeout. Return
+                  1220  ;with Z set and carry clear if it's an ACK
+                  1221  ;-----------------------------------------
+03B7  3E78        1222  GETACK:	ld	a,ACKTO*2	;ACK-wait timeout value
+03B9  CD0206      1223  	call	RXBYTE		;go get a character
+                  1224  				;times out to ACKERR
+                  1225  
+03BC  FE06        1226  	cp	a,ACK		;Did we get an ACK?
+03BE  C8          1227  	ret	Z		;Y: ret w/ a=0, Z set
+                  1228  				;..and carry cleared
+                  1229  ;---------------------------------------------
+                  1230  ;Is the receiver trying to cancel the session?
+                  1231  ;---------------------------------------------
+03BF  D618        1232  	sub	a,CAN		;Xmodem Cancel chr
+03C1  200F        1233  	jr	NZ,ACKERR
+                  1234  
+                  1235  ;Receiver sent us a CAN, so abort with message
+                  1236  
+03C3  5F          1237  	ld	e,a		;0 for sending
+03C4  CDC101      1238  	call	ABORT
+03C7  62792072    1239  	db	'by receive','r'+80h
+                  1240  ;------------------------------------------------
+                  1241  ;If anything else (or an RXBYTE timeout, which
+                  1242  ;jumps to ACKERR), print an error-pacifier and
+                  1243  ;return with Z cleared and ix backed up, unless
+                  1244  ;the user aborts. If too many errors, then abort.
+                  1245  ;------------------------------------------------
+03D2  CD9702      1246  ACKERR:	call	PACERR		;chance to abort too
+                  1247  
+03D5  1180FF      1248  	ld	de,-BLKSIZ	;back up DMA pointer
+03D8  DD19        1249  	add	ix,de
+                  1250  
+03DA  21F806      1251  	ld	hl,ERRCNT	;bump error count
+03DD  35          1252  	dec	(hl)
+03DE  C0          1253  	ret	NZ		;Z means too many
+                  1254  ;--------------------------------------
+                  1255  ;Abort waiting for ACK: Too many errors
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0033
+XMODEM 2.05 by Martin Eberhard
+Xmodem File Transfer Subroutines
+
+                  1256  ;--------------------------------------
+03DF  CDB301      1257  	call	CABORT		;cancel & abort
+03E2  31          1258  	db	[ERRLIM/10]+'0'
+03E3  30          1259  	db	[ERRLIM-[[ERRLIM/10]*10]]+'0'
+03E4  2041434B    1260  	db	' ACK error','s'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0034
+XMODEM 2.05 by Martin Eberhard
+Disk Transfer Subroutines
+
+                  1263  ;***Subroutine*****
+                  1264  ;Delete file at FCB
+                  1265  ;On Exit:
+                  1266  ;  de = FCB
+                  1267  ;Trashes af,c,hl
+                  1268  ;******************
+03EF  0E13        1269  FDELET:	ld	c,DELETF
+                  1270  
+                  1271  ;Fall into CDOSFC
+                  1272  
+                  1273  ;***Subroutine**************
+                  1274  ;Initate a CDOS file command
+                  1275  ;On Entry:
+                  1276  ;  c = CDOS command
+                  1277  ;On Exit:
+                  1278  ;  de = FCB
+                  1279  ;Trashes af,hl
+                  1280  ;***************************
+03F1  115C00      1281  CDOSFC:	ld	de,FCB
+03F4  C30500      1282  	jp	CDOS
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0035
+XMODEM 2.05 by Martin Eberhard
+Console I/O Routines
+
+                  1285  ;***Subroutine****************************************
+                  1286  ;Print In-line CR,LF, and then Message from caller.
+                  1287  ;The call to CILPRT is followed by a message string.
+                  1288  ;The string is terminated with the final chr's MSB set
+                  1289  ;On Exit:
+                  1290  ;  Z cleared
+                  1291  ;Trashes a,c
+                  1292  ;*****************************************************
+03F7  CDAD02      1293  CILPRT:	call	PCRLF
+                  1294  
+                  1295  ;Fall into ILPRNT
+                  1296  
+                  1297  ;***Subroutine****************************************
+                  1298  ;Print In-line Message
+                  1299  ;The call to ILPRT is followed by a message string.
+                  1300  ;The string is terminated with the final chr's MSB set
+                  1301  ;On Exit:
+                  1302  ;  Z cleared
+                  1303  ;Trashes a
+                  1304  ;*****************************************************
+03FA  E3          1305  ILPRNT:	ex	(SP),hl		;Save hl, get msg addr
+03FB  CDE706      1306  	call	HLPRNT		;go print the string
+03FE  E3          1307  	ex	(SP),hl		;Restore hl, and
+                  1308  				;..get return address
+03FF  C9          1309  	ret
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0036
+XMODEM 2.05 by Martin Eberhard
+CRC Table
+
+                  1312  ;***Table*******************************
+                  1313  ;CRC Calculation Tables
+                  1314  ;strategically placed on a page boundary
+                  1315  ;***************************************
+                  1316  ;Force the CRTTAB table to be page-aligned
+                  1317  
+      (0400)      1318  TPAGER	equ	$
+      (0400)      1319  	org	[TPAGER+255] and 0FF00h
+                  1320  
+                  1321  CRCTAB:
+                  1322  
+                  1323  ;----------
+                  1324  ;high bytes
+                  1325  ;----------
+0400  00102030    1326  	db	000h,010h,020h,030h,040h,050h,060h,070h
+0408  8191A1B1    1327  	db	081h,091h,0A1h,0B1h,0C1h,0D1h,0E1h,0F1h
+0410  12023222    1328  	db	012h,002h,032h,022h,052h,042h,072h,062h
+0418  9383B3A3    1329  	db	093h,083h,0B3h,0A3h,0D3h,0C3h,0F3h,0E3h
+0420  24340414    1330  	db	024h,034h,004h,014h,064h,074h,044h,054h
+0428  A5B58595    1331  	db	0A5h,0B5h,085h,095h,0E5h,0F5h,0C5h,0D5h
+0430  36261606    1332  	db	036h,026h,016h,006h,076h,066h,056h,046h
+0438  B7A79787    1333  	db	0B7h,0A7h,097h,087h,0F7h,0E7h,0D7h,0C7h
+0440  48586878    1334  	db	048h,058h,068h,078h,008h,018h,028h,038h
+0448  C9D9E9F9    1335  	db	0C9h,0D9h,0E9h,0F9h,089h,099h,0A9h,0B9h
+0450  5A4A7A6A    1336  	db	05Ah,04Ah,07Ah,06Ah,01Ah,00Ah,03Ah,02Ah
+0458  DBCBFBEB    1337  	db	0DBh,0CBh,0FBh,0EBh,09Bh,08Bh,0BBh,0ABh
+0460  6C7C4C5C    1338  	db	06Ch,07Ch,04Ch,05Ch,02Ch,03Ch,00Ch,01Ch
+0468  EDFDCDDD    1339  	db	0EDh,0FDh,0CDh,0DDh,0ADh,0BDh,08Dh,09Dh
+0470  7E6E5E4E    1340  	db	07Eh,06Eh,05Eh,04Eh,03Eh,02Eh,01Eh,00Eh
+0478  FFEFDFCF    1341  	db	0FFh,0EFh,0DFh,0CFh,0BFh,0AFh,09Fh,08Fh
+0480  9181B1A1    1342  	db	091h,081h,0B1h,0A1h,0D1h,0C1h,0F1h,0E1h
+0488  10003020    1343  	db	010h,000h,030h,020h,050h,040h,070h,060h
+0490  8393A3B3    1344  	db	083h,093h,0A3h,0B3h,0C3h,0D3h,0E3h,0F3h
+0498  02122232    1345  	db	002h,012h,022h,032h,042h,052h,062h,072h
+04A0  B5A59585    1346  	db	0B5h,0A5h,095h,085h,0F5h,0E5h,0D5h,0C5h
+04A8  34241404    1347  	db	034h,024h,014h,004h,074h,064h,054h,044h
+04B0  A7B78797    1348  	db	0A7h,0B7h,087h,097h,0E7h,0F7h,0C7h,0D7h
+04B8  26360616    1349  	db	026h,036h,006h,016h,066h,076h,046h,056h
+04C0  D9C9F9E9    1350  	db	0D9h,0C9h,0F9h,0E9h,099h,089h,0B9h,0A9h
+04C8  58487868    1351  	db	058h,048h,078h,068h,018h,008h,038h,028h
+04D0  CBDBEBFB    1352  	db	0CBh,0DBh,0EBh,0FBh,08Bh,09Bh,0ABh,0BBh
+04D8  4A5A6A7A    1353  	db	04Ah,05Ah,06Ah,07Ah,00Ah,01Ah,02Ah,03Ah
+04E0  FDEDDDCD    1354  	db	0FDh,0EDh,0DDh,0CDh,0BDh,0ADh,09Dh,08Dh
+04E8  7C6C5C4C    1355  	db	07Ch,06Ch,05Ch,04Ch,03Ch,02Ch,01Ch,00Ch
+04F0  EFFFCFDF    1356  	db	0EFh,0FFh,0CFh,0DFh,0AFh,0BFh,08Fh,09Fh
+04F8  6E7E4E5E    1357  	db	06Eh,07Eh,04Eh,05Eh,02Eh,03Eh,00Eh,01Eh
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0037
+XMODEM 2.05 by Martin Eberhard
+CRC Table
+
+                  1359  ;---------
+                  1360  ;Low Bytes
+                  1361  ;---------
+0500  00214263    1362  	db	000h,021h,042h,063h,084h,0A5h,0C6h,0E7h
+0508  08294A6B    1363  	db	008h,029h,04Ah,06Bh,08Ch,0ADh,0CEh,0EFh
+0510  31107352    1364  	db	031h,010h,073h,052h,0B5h,094h,0F7h,0D6h
+0518  39187B5A    1365  	db	039h,018h,07Bh,05Ah,0BDh,09Ch,0FFh,0DEh
+0520  62432001    1366  	db	062h,043h,020h,001h,0E6h,0C7h,0A4h,085h
+0528  6A4B2809    1367  	db	06Ah,04Bh,028h,009h,0EEh,0CFh,0ACh,08Dh
+0530  53721130    1368  	db	053h,072h,011h,030h,0D7h,0F6h,095h,0B4h
+0538  5B7A1938    1369  	db	05Bh,07Ah,019h,038h,0DFh,0FEh,09Dh,0BCh
+0540  C4E586A7    1370  	db	0C4h,0E5h,086h,0A7h,040h,061h,002h,023h
+0548  CCED8EAF    1371  	db	0CCh,0EDh,08Eh,0AFh,048h,069h,00Ah,02Bh
+0550  F5D4B796    1372  	db	0F5h,0D4h,0B7h,096h,071h,050h,033h,012h
+0558  FDDCBF9E    1373  	db	0FDh,0DCh,0BFh,09Eh,079h,058h,03Bh,01Ah
+0560  A687E4C5    1374  	db	0A6h,087h,0E4h,0C5h,022h,003h,060h,041h
+0568  AE8FECCD    1375  	db	0AEh,08Fh,0ECh,0CDh,02Ah,00Bh,068h,049h
+0570  97B6D5F4    1376  	db	097h,0B6h,0D5h,0F4h,013h,032h,051h,070h
+0578  9FBEDDFC    1377  	db	09Fh,0BEh,0DDh,0FCh,01Bh,03Ah,059h,078h
+0580  88A9CAEB    1378  	db	088h,0A9h,0CAh,0EBh,00Ch,02Dh,04Eh,06Fh
+0588  80A1C2E3    1379  	db	080h,0A1h,0C2h,0E3h,004h,025h,046h,067h
+0590  B998FBDA    1380  	db	0B9h,098h,0FBh,0DAh,03Dh,01Ch,07Fh,05Eh
+0598  B190F3D2    1381  	db	0B1h,090h,0F3h,0D2h,035h,014h,077h,056h
+05A0  EACBA889    1382  	db	0EAh,0CBh,0A8h,089h,06Eh,04Fh,02Ch,00Dh
+05A8  E2C3A081    1383  	db	0E2h,0C3h,0A0h,081h,066h,047h,024h,005h
+05B0  DBFA99B8    1384  	db	0DBh,0FAh,099h,0B8h,05Fh,07Eh,01Dh,03Ch
+05B8  D3F291B0    1385  	db	0D3h,0F2h,091h,0B0h,057h,076h,015h,034h
+05C0  4C6D0E2F    1386  	db	04Ch,06Dh,00Eh,02Fh,0C8h,0E9h,08Ah,0ABh
+05C8  44650627    1387  	db	044h,065h,006h,027h,0C0h,0E1h,082h,0A3h
+05D0  7D5C3F1E    1388  	db	07Dh,05Ch,03Fh,01Eh,0F9h,0D8h,0BBh,09Ah
+05D8  75543716    1389  	db	075h,054h,037h,016h,0F1h,0D0h,0B3h,092h
+05E0  2E0F6C4D    1390  	db	02Eh,00Fh,06Ch,04Dh,0AAh,08Bh,0E8h,0C9h
+05E8  26076445    1391  	db	026h,007h,064h,045h,0A2h,083h,0E0h,0C1h
+05F0  1F3E5D7C    1392  	db	01Fh,03Eh,05Dh,07Ch,09Bh,0BAh,0D9h,0F8h
+05F8  17365574    1393  	db	017h,036h,055h,074h,093h,0B2h,0D1h,0F0h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0038
+XMODEM 2.05 by Martin Eberhard
+Receive a Character Subroutines
+
+                  1396  ;***Subroutine******************************
+                  1397  ;Receive a byte, with 1-second timeout
+                  1398  ;On Entry:
+                  1399  ;  iy = timeout return address
+                  1400  ;  XMODE<1> = 1 iff called from within FLUSH
+                  1401  ;          (meaning CCTRLC should not flush)
+                  1402  ;On Exit:
+                  1403  ;  a = received byte if no timeout
+                  1404  ;  exit to (iy) if timeout
+                  1405  ;*******************************************
+0600  3E02        1406  RXBYT1:	ld	a,2
+                  1407  
+                  1408  ;	fall into RXBYTE
+                  1409  
+                  1410  ;***Subroutine***************************************
+                  1411  ;Receive a byte from the selected TU-ART port, and
+                  1412  ;test for abort every 1/2 sec while waiting
+                  1413  ;
+                  1414  ;If we timeout waiting to start sending a file, then
+                  1415  ;  jump to to WAITNK (in iy) to send another NAK or
+                  1416  ;  SELCRC (based on error checking mode) to try again.
+                  1417  ;If we time out waiting to receive an ACK while
+                  1418  ;  sending a file) then jump to ACKERR (in iy) to print
+                  1419  ;  a failure pacifier, and try again.
+                  1420  ;If time out receiving a file, then jump to RXBERR
+                  1421  ;  (in iy) to send a NAK and try again. All timeouts
+                  1422  ;  abort when ERRCNT decrements to 0.
+                  1423  ;On Entry:
+                  1424  ;  a = timeout value in half-seconds
+                  1425  ;  c'=TU-ART control port
+                  1426  ;  iy = timeout return address
+                  1427  ;  ERRCNT = count-down for errors
+                  1428  ;  XMODE<1> = 1 iff called from within FLUSH
+                  1429  ;          (meaning CCTRLC should not flush)
+                  1430  ;On Exit:
+                  1431  ;  a = received byte if no timeout
+                  1432  ;  exit to (iy) if timeout
+                  1433  ;trashes b',de'
+                  1434  ;****************************************************
+0602  D9          1435  RXBYTE:	exx			;alt registers
+0603  47          1436  	ld	b,a		;b'=timeout value
+                  1437  
+0604  111089      1438  MS500:	ld	de,35088	;1/2-sec count down
+                  1439  
+0607  ED78        1440  RXWAIT:	in	a,(c)		;(12)Read Rx status
+0609  E640        1441  	and	a,TURBF		;(7)buffer full?
+060B  2806        1442  	jr	Z,RXWAT1	;(12)No byte yet?
+                  1443  
+060D  0C          1444  	inc	c		;Point to data port
+060E  ED78        1445  	in	a,(c)		;Read modem byte
+0610  0D          1446  	dec	c		;restore to status port
+                  1447  
+0611  D9          1448  	exx			;normal registers
+0612  C9          1449  	ret			;with rx byte in a
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0039
+XMODEM 2.05 by Martin Eberhard
+Receive a Character Subroutines
+
+                  1450  
+                  1451  ;keep waiting
+                  1452  
+0613  1B          1453  RXWAT1:	dec	de		;(6)timeout low word
+0614  7A          1454  	ld	a,d		;(4)Test for 16-bit 0
+0615  B3          1455  	or	a,e		;(4)
+0616  20EF        1456  	jr	NZ,RXWAIT	;(12)
+                  1457  		;inner loop:57 cycles=14.25 uS
+                  1458  		;0.5 sec / 14.25 uS = 355088 cycles
+0618  D9          1459  	exx			;normal registers
+0619  C5          1460  	push	bc
+061A  CDC202      1461  	call	CCTRLC		;user abort? trashes c
+061D  C1          1462  	pop	bc
+061E  D9          1463  	exx			;alt registers
+                  1464  
+061F  10E3        1465  	djnz	MS500		;spin b half-seconds
+                  1466  
+                  1467  ;Timeout receiving. fix stack &
+                  1468  ;register set, go to error address
+                  1469  ; top-of-stack = RXBYTE return address
+                  1470  ; iy = timeout return address
+                  1471  
+0621  D1          1472  	pop	de		;chuck RXBYTE ret addr
+0622  D9          1473  	exx			;normal registers
+0623  FDE9        1474  	jp	(iy)		;abort RXBYTE
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0040
+XMODEM 2.05 by Martin Eberhard
+Fill BUFFER from Disk Subroutine
+
+                  1477  ;***Subroutine****************************************
+                  1478  ;Read more records from the disk and put them in the
+                  1479  ;BUFFER until it is full or we reach the EOF.
+                  1480  ;Interleave sending an Xmodem block every RBPERX
+                  1481  ;disk records, to keep the receiver happy (unless
+                  1482  ;CRCFLG=FF, indicating the initial BUFFER fill).
+                  1483  ;On Entry:
+                  1484  ;  BUFCNT = 0
+                  1485  ;  BUFMAX = start address of the last possible record
+                  1486  ;     in the BUFFER, equal to the last address in
+                  1487  ;     BUFFER - 127
+                  1488  ;  CRCFLG = FF during initial fill, 00 or 01 otherwise
+                  1489  ;On Exit:
+                  1490  ;  ix = BUFFER address of next block to send
+                  1491  ;  BUFCNT = number of 128-byte blocks in the BUFFER
+                  1492  ;  hl = (BUFCNT)
+                  1493  ;  EOFLAG <> 0 if EOF encountered
+                  1494  ;  direct exit to TXEOT if no more data
+                  1495  ;Trashes af,bc,de
+                  1496  ;*****************************************************
+0625  3AFE06      1497  FILBUF:	ld	a,(EOFLAG)	;already seen the EOF?
+0628  B7          1498  	or	a,a
+0629  2032        1499  	jr	NZ,TXEOT	;y: no more data.
+                  1500  
+062B  110207      1501  	ld	de,BUFFER	;address in BUFFER
+062E  DD210207    1502  	ld	ix,BUFFER	;Xmodem block pointer
+                  1503  ;-----------------------------------------------------
+                  1504  ;Loop to fill the BUFFER from disk. Every RBPERX
+                  1505  ;record-reads, stop to send one Xmodem block - often
+                  1506  ;enough that the receiver does not time out. Send
+                  1507  ;these blocks from the BUFFER, from where we have just
+                  1508  ;filled by reading from disk.
+                  1509  ;
+                  1510  ; b = RBERX count-down of received xmodem blocks
+                  1511  ;   (to prevent timeout)
+                  1512  ; de = BUFFER pointer for writing to disk
+                  1513  ; ix = DMA address pointer for sending Xmodem blocks
+                  1514  ; BUFCNT counts unsent blocks in BUFFER
+                  1515  ; BUFMAX = last BUFFER address-127
+                  1516  ; XMODE = 0
+                  1517  ;-----------------------------------------------------
+      (0000)      1518   if RBPERX < 257
+                  1519  
+                  1520  FBLP0:	call	CCTRLC		;user abort: trashes c
+                  1521  
+                  1522  	ld    b,RBPERX and 0FFh	;interleaved Tx tr
+                  1523  
+                  1524   endif ;RBPERX < 257
+                  1525  
+0632  0E1A        1526  FBLOOP:	ld	c,STDMAF	;de=CDOS DMA address
+0634  CD0500      1527  	call	CDOS		;trashes no registers
+                  1528  
+0637  EB          1529  	ex	de,hl		;pointer to hl, free de
+                  1530  
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0041
+XMODEM 2.05 by Martin Eberhard
+Fill BUFFER from Disk Subroutine
+
+0638  0E14        1531  	ld	c,READF		;Disk rec into BUFFER
+063A  CDF103      1532  	call	CDOSFC		;ret de=FCB, a=status
+                  1533  
+063D  B7          1534  	or	a,a		;Read ok?
+063E  2014        1535  	jr	NZ,FBEOF 	;No: must be EOF
+                  1536  
+0640  118000      1537  	ld	de,RECSIZ 	;disk record size
+0643  19          1538  	add	hl,de		;next disk rec address
+                  1539  				;(Clears Cy)
+0644  EB          1540  	ex	de,hl		;..into de
+                  1541  
+0645  2AFC06      1542  	ld	hl,(BUFMAX)	;max BUFFER block start
+0648  ED52        1543  	sbc	hl,de		;Cy set if de>hl
+                  1544  
+064A  2AFA06      1545  	ld	hl,(BUFCNT)	;bump block count
+064D  23          1546  	inc	hl		;assumes blocks are the
+064E  22FA06      1547  	ld	(BUFCNT),hl	;same size as disk recs
+                  1548  
+0651  D8          1549  	ret	C		;ret if BUFFER full
+                  1550  ;---------------------------------------------
+                  1551  ;If it's time to send another Xmodem block (to
+                  1552  ;keep the receiver happy), and if this is not
+                  1553  ;the initial BUFFER fill (CRCFLG=FF), then
+                  1554  ;send one, bumping ix and decrementing BUFCNT.
+                  1555  ; hl = (BUFCNT)
+                  1556  ;---------------------------------------------
+      (0000)      1557   if RBPERX < 257
+                  1558  
+                  1559  	djnz	FBLOOP		;need to Tx a block?
+                  1560  
+                  1561  	push	de		;next rec address
+                  1562  
+                  1563  	ld	a,(CRCFLG)	;initial fill?
+                  1564  	inc	a		;FF means uninitialized
+                  1565  
+                  1566  				;hl=(BUFCNT)
+                  1567  	call	NZ,TXBLK	;Send a block unless
+                  1568  				;..initial fill
+                  1569  	pop	de		;next rec address
+                  1570  
+                  1571  	jr	FBLP0		;next disk record
+                  1572  
+                  1573   else
+0652  18DE        1574  	jr	FBLOOP
+                  1575  
+                  1576   endif ;RBPERX < 257
+                  1577  
+                  1578  ;-------------------------------------------
+                  1579  ;We got an EOF from CDOS. If the BUFFER has
+                  1580  ;0 disk records, then send the EOF and end.
+                  1581  ;Otherwise return to send the BUFFER blocks.
+                  1582  ;On Entry:
+                  1583  ;  a <> 0
+                  1584  ;  ix = BUFFER start address
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0042
+XMODEM 2.05 by Martin Eberhard
+Fill BUFFER from Disk Subroutine
+
+                  1585  ;On Exit:
+                  1586  ;  hl = (BUFCNT)
+                  1587  ;  ix = BUFFER start address
+                  1588  ;  EOFLAG <> 0
+                  1589  ;-------------------------------------------
+0654  32FE06      1590  FBEOF:	ld	(EOFLAG),a	;Set EOF flag
+                  1591  
+0657  2AFA06      1592  	ld	hl,(BUFCNT)
+065A  7C          1593  	ld	a,h		;no records from disk?
+065B  B5          1594  	or	a,l
+065C  C0          1595  	ret	NZ		;n: ret with hl=BUFCNT
+                  1596  
+                  1597  ;Fall into TXEOT to end transmission
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0043
+XMODEM 2.05 by Martin Eberhard
+End File TRansmission
+
+                  1600  ;***Exit***********************************************
+                  1601  ;File send completed. Send EOT'S until we get an ACK
+                  1602  ;Then print happy message, report block count and exit.
+                  1603  ;On Entry:
+                  1604  ;  hl'= 16-bit block number of the last block sent
+                  1605  ;******************************************************
+065D  3E04        1606  TXEOT:	ld	a,EOT		;Send an EOT
+065F  CDB502      1607  	call	TXBYTE
+                  1608  
+0662  CDB703      1609  	call	GETACK		;Wait for an ACK
+0665  20F6        1610  	jr	NZ,TXEOT	;Loop until we get ACK
+                  1611  
+0667  CDF703      1612  	call	CILPRT		;report success
+066A  4F4B0D0A    1613  	db	'OK',CR,LF
+066E  53656E74    1614  	db	'Sent',' '+80h
+                  1615  
+0673  C3A501      1616  	jp	REPCNT		;print count, goto CDOS
+                  1617  ;***Exit*******************************
+                  1618  ;Error closing file: abort with message
+                  1619  ;**************************************
+0676  CD4202      1620  CFAIL:	call	CMSGXT
+0679  46494C45    1621      db 'FILE CLOSE FAIL! File may be corrup','t'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0044
+XMODEM 2.05 by Martin Eberhard
+Console Input/Output Subroutines
+
+                  1624  ;***Subroutine*********************
+                  1625  ;Print hl in decimal on the console
+                  1626  ;with leading zeros suppressed
+                  1627  ;Trashes af,bc,e,hl
+                  1628  ;**********************************
+069D  1E00        1629  PDEC16:	ld	e,0	;Suppress leading 0's
+                  1630  
+069F  01F0D8      1631  	ld	bc,-10000
+06A2  CDB806      1632  	call	DECDIG
+06A5  0118FC      1633  	ld	bc,-1000
+06A8  CDB806      1634  	call	DECDIG
+06AB  019CFF      1635  	ld	bc,-100
+06AE  CDB806      1636  	call	DECDIG
+06B1  0EF6        1637  	ld	c,-10	;b=0FFh already
+06B3  CDB806      1638  	call	DECDIG
+                  1639  
+06B6  58          1640  	ld	e,b	;e>09h: don't suppress last 0
+06B7  48          1641  	ld	c,b	;b=0FFh already: bc=-1
+                  1642  
+                  1643  ;Fall into DECDIG to print the 1's digit
+                  1644  
+                  1645  ;-----Local Subroutine------------------------
+                  1646  ;Divide hl by power of 10 in bc and print the
+                  1647  ;result, unless it's a leading 0.
+                  1648  ;On Entry:
+                  1649  ;  hl = Dividend
+                  1650  ;  bc = -divisor (a negative power of 10)
+                  1651  ;  e = 0 if all prior digits were 0
+                  1652  ;On Exit:
+                  1653  ;  Quotent is printed, unless it's a leading 0
+                  1654  ;  hl = remainder
+                  1655  ;  b unchanged
+                  1656  ;  e = 0 iff this and all prior digits are 0
+                  1657  ;    e>09h if a zero digit should be printed
+                  1658  ;trashes af,c
+                  1659  ;---------------------------------------------
+06B8  3EFF        1660  DECDIG:	ld	a,-1	;will go 1 too many times
+                  1661  
+06BA  3C          1662  DIGLP:	inc	a	;calculate quotient in ASCII
+06BB  09          1663  	add	hl,bc	;subtract power of 10
+06BC  38FC        1664  	jr	C,DIGLP
+                  1665  
+06BE  ED42        1666  	sbc	hl,bc	;fix remainder (carry clear)
+                  1667  			;..loop went 1 too many)
+                  1668  
+06C0  BB          1669  	cp	a,e	;is this a leading 0?
+                  1670  			;(e is 0 or ASCII, but
+                  1671  			;..a is never ASCII)
+06C1  C8          1672  	ret	Z	;yes: digit is done
+                  1673  
+06C2  C630        1674  	add	a,'0'	;make it ASCII
+06C4  5F          1675  	ld	e,a	;don't suppress further 0's
+06C5  C3A602      1676  	jp	PRINTE	;print digit in e, trash c
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0045
+XMODEM 2.05 by Martin Eberhard
+Console Input/Output Subroutines
+
+                  1678  ;***Subroutine********************
+                  1679  ;Print ' with CRCs' on the console
+                  1680  ;On Exit:
+                  1681  ;  Z cleared
+                  1682  ;Trashes a,c
+                  1683  ;*********************************
+06C8  CDFA03      1684  PCRC:	call	ILPRNT
+06CB  77697468    1685  	db	'with CRC','s'+80h
+06D4  C9          1686  	ret
+                  1687  ;***Subroutine*************************
+                  1688  ;Print ' with checksums' on the console
+                  1689  ;On Exit:
+                  1690  ;  Z cleared
+                  1691  ;Trashes a
+                  1692  ;**************************************
+06D5  CDFA03      1693  PCKSUM:	call	ILPRNT
+06D8  77697468    1694  	db	'with checksum','s'+80h
+06E6  C9          1695  	ret
+                  1696  ;***Subroutine****************************************
+                  1697  ;Print Message at hl
+                  1698  ;The string is terminated with the final chr's MSB set
+                  1699  ;On Entry:
+                  1700  ;  hl points to the string
+                  1701  ;On Exit:
+                  1702  ;  hl points to the next address past the string
+                  1703  ;  Z cleared
+                  1704  ;Trashes a
+                  1705  ;*****************************************************
+06E7  C5          1706  HLPRNT:	push	bc
+06E8  D5          1707  	push	de
+                  1708  
+06E9  5E          1709  IPLOOP:	ld	e,(hl)
+06EA  CBBB        1710  	res	7,e		;clear end flag
+06EC  CDA602      1711  	call	PRINTE		;print byte
+                  1712  
+06EF  7E          1713  	ld	a,(hl)		;end of string?
+06F0  BB          1714  	cp	e
+06F1  23          1715  	inc	hl		;Next byte
+06F2  28F5        1716  	jr	Z,IPLOOP	;Do all bytes of msg
+                  1717  
+06F4  D1          1718  	pop	de
+06F5  C1          1719  	pop	bc
+06F6  C9          1720  	ret
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0046
+XMODEM 2.05 by Martin Eberhard
+Buffer and Initialized RAM Variables
+
+                  1723  ;======================================================
+                  1724  ;RAM Variables and Storage, all initialized during load
+                  1725  ;======================================================
+                  1726  ;------------------------------
+                  1727  ;Xmodem file transfer variables
+                  1728  ;------------------------------
+06F7  00          1729  RXBDIF:	db	0	;Received block number minus
+                  1730  			;..previous block's block no.
+06F8  00          1731  ERRCNT:	db	0	;Error count-down
+06F9  15          1732  NAKCHR:	db	NAK	;current NAK chr
+                  1733  ;------------------------
+                  1734  ;Disk buffering variables
+                  1735  ;------------------------
+06FA  0000        1736  BUFCNT:	dw	0	;Count of Xmodem blocks in BUF
+06FC  0000        1737  BUFMAX:	dw	0	;Rx:max address in BUFFER+1
+                  1738  			;Tx:max address in BUFFER-127
+                  1739  
+06FE  00          1740  EOFLAG:	db	0	;EOF flag (FFh means true)
+                  1741  ;---Table---------------------------
+                  1742  ;Command line option variables
+                  1743  ;These variables are required during
+                  1744  ;file transfers, and therefore must
+                  1745  ;not be overwritten by the BUFFER.
+                  1746  ;-----------------------------------
+                  1747  VARTAB:			;Basis for var. address offsets
+                  1748  
+06FF  FF          1749  XMODE:	db	0FFh	;00: send
+                  1750  			;X1: Rx, not currently flushing
+                  1751  			;X2: Rx, currently flushing
+                  1752  			;01 or 02: no disk writes yet
+                  1753  			;8x: disk writes have occured 
+                  1754  			;FFh: uninitialized
+                  1755  
+0700  00          1756  PACCNT:	db	0	;Current column count-down for
+                  1757  			;..pacifiers. Init for new line				;FF means quiet mode
+                  1758  			;CRCFLG must follow PACCNT
+                  1759  
+0701  FF          1760  CRCFLG:	db	0FFh	;0: cksum, 1: CRC, FF: uninit'd
+                  1761  			;CRCFLG must follow PACCNT
+                  1762  
+                  1763  ;==================================================
+                  1764  ;=Buffer for Xmodem blocks. This buffer overwrites=
+                  1765  ;=all of the following initialization code.       =
+                  1766  ;==================================================
+      (0702)      1767  BUFFER	equ	$
+                  1768  
+                  1769  ;---Table (continued)----------------
+                  1770  ;More command line option variables
+                  1771  ;These variables are only used during
+                  1772  ;initialization, and get overwritten
+                  1773  ;by the BUFFER.
+                  1774  ;------------------------------------
+0702  41          1775  TPORT:	db	DEFPORT	    ;Transfer port: 'A' - 'C'
+0703  88          1776  BAUDRT:	db	DEFBAUD+80h ;current baud rate
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0047
+XMODEM 2.05 by Martin Eberhard
+Buffer and Initialized RAM Variables
+
+                  1777  			    ;msb means defaulted
+0704  3F          1778  BKBYTS:	db	DEFBSIZ	    ;K-bytes in the BUFFER
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0048
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  1781  ;==================================================
+                  1782  ;The following subroutines are used only during the
+                  1783  ;initial command line processing, and get wiped out
+                  1784  ;by the BUFFER, once we start transfering data.
+                  1785  ;==================================================
+                  1786  
+                  1787  ;***Initialization*************
+                  1788  ;Parse command line, set up FCB
+                  1789  ;******************************
+                  1790  ;------------------
+                  1791  ;Create local stack
+                  1792  ;------------------
+0705  310901      1793  INIT:	ld	SP,STACK
+                  1794  ;------------
+                  1795  ;Print banner
+                  1796  ;------------
+0708  CDF703      1797  	call	CILPRT
+070B  3D3D3D3D    1798   db '===============================',CR,LF
+072C  43444F53    1799   db 'CDOS Xmodem '
+                  1800  
+0738  322E        1801   db [(VERS AND 0F00h)/256]+'0','.'
+073A  3035        1802   db [(VERS AND 0F0h)/16]+'0',[VERS AND 0Fh]+'0'
+                  1803  
+073C  20427920    1804   db	' By M. Eberhard',CR,LF
+074D  3D3D3D3D    1805   db '==============================','='+80h
+                  1806  ;-----------------------------------
+                  1807  ;Point to command line options, and
+                  1808  ;find the beginning of the file name
+                  1809  ;-----------------------------------
+076C  218100      1810  	ld	hl,COMBUF+1	;CDOS put 0-terminated
+                  1811  				;...command line here
+                  1812  
+076F  CD4F0C      1813  	call	SSKIP		;skip initial spaces
+0772  CAC109      1814  	jp	Z,HLPEXT	;no parameters?
+                  1815  ;-------------------------------------
+                  1816  ;Skip past the file name, which CDOS
+                  1817  ;already put in the FCB for us
+                  1818  ; b = bytes remaining to see in COMBUF
+                  1819  ; hl points to next chr in COMBUF
+                  1820  ;-------------------------------------
+0775  CD5F0C      1821  SKPFIL:	call	CMDCHR
+0778  2864        1822  	jr	Z,OPTDON	;no options
+                  1823  
+077A  FE2F        1824  	cp	a,'/'		;option crammed
+077C  280E        1825  	jr	Z,OPTLP2	;..against file name?
+                  1826  
+077E  FE20        1827  	cp	a,' '		;hunt for a space
+0780  20F3        1828  	jr	NZ,SKPFIL	;space past filename
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0049
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  1830  ;-----------------------------------------------
+                  1831  ;Parse all command line options and set
+                  1832  ;variables accordingly. Each option must be
+                  1833  ;preceeded by a '/' and followed by an ASCII, a
+                  1834  ;1- or 2-digit numeric, or no value. Options may
+                  1835  ;be preceed by any reasonable number of spaces.
+                  1836  ;-----------------------------------------------
+0782  CD4F0C      1837  OPTLUP:	call	SSKIP		;skip spaces
+0785  2857        1838  	jr	Z,OPTDON
+                  1839  
+0787  FE2F        1840  	cp	a,'/'		;all start with /
+0789  C2BA09      1841  	jp	NZ, BADINP	;error:no slash
+                  1842  
+078C  CD5F0C      1843  OPTLP2:	call	CMDCHR		;Get an option chr
+078F  CABA09      1844  	jp	Z,BADINP	;Error: nothing after /
+                  1845  
+0792  4F          1846  	ld	c,a		;save while we get val
+                  1847  
+0793  328D09      1848  	ld	(PAR1),a	;put it in error msgs
+0796  32B809      1849  	ld	(PAR2),a	;in case it's bad
+                  1850  ;--------------------------------------
+                  1851  ;Set de=1 or 2 bytes that came with
+                  1852  ;this option, if any. Set de=0 if none.
+                  1853  ;--------------------------------------
+0799  110000      1854  	ld	de,0	;assume no parameter
+                  1855  
+079C  CD580C      1856  	call	CMDVAL	;get 1st param chr
+079F  2808        1857  	jr	Z,GV1	;Z:no more chrs in param
+07A1  5F          1858  	ld	e,a	;1st param chr	
+                  1859  
+07A2  CD580C      1860  	call	CMDVAL	;get 2nd param chr
+07A5  2802        1861  	jr	Z,GV1	;Z:no more chrs in param
+07A7  53          1862  	ld	d,e	;shift 1st chr over
+07A8  5F          1863  	ld	e,a	;2nd param chr
+                  1864  GV1:
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0050
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  1866  ;------------------------------------------------
+                  1867  ;Got a command line option in c and a value for
+                  1868  ;that option in de. Loop through table of options,
+                  1869  ;looking for a match. Bounds-check value using
+                  1870  ;table entries. Update the appropriate option
+                  1871  ;variable with the provided value. Error exit if
+                  1872  ;no match, or if the value is out of bounds.
+                  1873  ;------------------------------------------------
+07A9  E5          1874  	push	hl		;Save COMBUF pointer
+                  1875  
+07AA  211E0D      1876  	ld	hl,OPTTAB-3
+                  1877  
+07AD  23          1878  CHKLUP:	inc	hl		;next table entry
+07AE  23          1879  	inc	hl
+07AF  23          1880  	inc	hl
+                  1881  
+07B0  79          1882  	ld	a,c		;option chr from user
+07B1  96          1883  	sub	a,(hl)		;Match? (alpha order)
+07B2  23          1884  	inc	hl		;point to min value
+07B3  DAA409      1885  	jp	C,BADPAR	;Carry: Not in table
+07B6  20F5        1886  	jr	NZ,CHKLUP	;No match: keep looking
+                  1887  
+                  1888  ;Table match. Get and test min value from the table.
+                  1889  ; a = 0
+                  1890  ; de = option value from user
+                  1891  ; (hl) = min value from table
+                  1892  
+07B8  86          1893  	add	a,(hl)		;get min value & test
+07B9  4F          1894  	ld	c,a		;min value from table
+07BA  23          1895  	inc	hl		;point to range
+07BB  2006        1896  	jr	NZ,CHK1		;min=0 is special case
+                  1897  
+                  1898  ;deal with special case option that has no value
+                  1899  ; a = 0
+                  1900  ; de = option value from user (should be 0)
+                  1901  ; (hl) = range from table
+                  1902  
+07BD  B3          1903  	or	a,e		;should have no value
+07BE  2010        1904  	jr	NZ,CHK2		;Hop to BADVAL
+                  1905  
+07C0  4E          1906  	ld	c,(hl)		;get value from table
+07C1  1811        1907  	jr	CHK3
+                  1908  
+                  1909  ;bounds-check value that came with option
+                  1910  ; Sign bit set means ASCII decimal numbers in de
+                  1911  ; otherwise, the user input value is in e
+                  1912  ; c = min value from table
+                  1913  ; (hl) = range from table
+                  1914  
+07C3  FC5B09      1915  CHK1:	call	M,DEC2BN	;Sign bit set: convert
+                  1916  				;..de to binary in e
+                  1917  				;..and clear d
+                  1918  
+07C6  CBB9        1919  	res	7,c		;clear msb flag
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0051
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+07C8  7B          1920  	ld	a,e		;param from input
+07C9  91          1921  	sub	a,c		;a=value - min
+                  1922  
+07CA  BE          1923  	cp	a,(hl)		;compare to max range
+07CB  D27409      1924  	jp	NC,BADVAL
+                  1925  
+07CE  7A          1926  	ld	a,d		;too many digits?
+07CF  B7          1927  	or	a
+                  1928  
+07D0  C27409      1929  CHK2:	jp	NZ,BADVAL
+                  1930  
+07D3  4B          1931  	ld	c,e		;parameter value
+                  1932  
+                  1933  ; c = paramater value
+                  1934  ; d = 0
+                  1935  ; (hl) = range from table
+                  1936  
+07D4  23          1937  chk3:	inc	hl		;point to address offset
+07D5  5E          1938  	ld	e,(hl)		;get de=address offset
+                  1939  
+07D6  21FF06      1940  	ld	hl,VARTAB	;base address of vars
+07D9  19          1941  	add	hl,de		;address of variable
+                  1942  
+07DA  71          1943  	ld	(hl),c		;update variable
+                  1944  
+07DB  E1          1945  	pop	hl		;Restore COMBUF pointer
+                  1946  
+07DC  18A4        1947  	jr	OPTLUP		;look for more
+                  1948  OPTDON:
+                  1949  ;----------------------------------------
+                  1950  ;Done parsing command line. Check to see
+                  1951  ;if a file name at least existed. (CDOS
+                  1952  ;won't put one here if it starts with /.)
+                  1953  ;----------------------------------------
+07DE  3A5D00      1954  	ld	a,(FCBFN)	;1st chr of filename
+07E1  FE20        1955  	cp	' '
+07E3  CABA09      1956  	jp	Z,BADINP
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0052
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  1958  ;------------------------------------------------
+                  1959  ;Print selected port on Console and set up c' to
+                  1960  ;point to the chosen transfer port.
+                  1961  ;  TPORT = 'A' or 'B' for TU-ART Port A or B.
+                  1962  ;  TPORT = 'C' for the console. If 'C' then force
+                  1963  ;           Quiet mode, and don't set up the UART.
+                  1964  ;------------------------------------------------
+07E6  CDF703      1965  	call	CILPRT		;print this message
+                  1966  
+07E9  436F6E66    1967  	db 'Configured for',' '+80h
+                  1968  
+07F8  3A0207      1969  	ld	a,(TPORT)	;TU-ART or console?
+07FB  5F          1970  	ld	e,a		;for message
+07FC  D643        1971  	sub	'C'
+07FE  4F          1972  	ld	c,a
+07FF  2027        1973  	jr	NZ,PS1
+                  1974  
+                  1975  ;Console port is the transfer port
+                  1976  ;No baud rate selection, force quiet mode
+                  1977  ; a = 0
+                  1978  
+0801  D9          1979  PS3:	exx			;alt regs
+0802  0E00        1980  	ld	c,FDC16S	;c'= port base address
+0804  67          1981  	ld	h,a		;0
+0805  6F          1982  	ld	l,a		;initialize blk cnt=0
+0806  D9          1983  	exx
+                  1984  
+0807  3D          1985  	dec	a		;0FFh
+0808  320007      1986  	ld	(PACCNT),a	;force quiet mode
+                  1987  
+080B  CDFA03      1988  	call	ILPRNT
+080E  7472616E    1989  	db	'transfer via the Consol','e'+80h
+                  1990  
+0826  1872        1991  	jr	PS4
+                  1992  
+                  1993  ;One of the TU-ART ports is the transfer port
+                  1994  
+0828  CDFA03      1995  PS1:	call	ILPRNT
+082B  54552D41    1996  	db	'TU-ART Port',' '+80h
+                  1997  
+0837  3E20        1998  	ld	a,TUARTA
+0839  0C          1999  	inc	c		;Port A or B
+083A  2002        2000  	jr	NZ,PS2
+                  2001  
+083C  3E50        2002  	ld	a,TUARTB	;TU-ART port B
+                  2003  
+083E  D9          2004  PS2:	exx			;alt regs
+083F  4F          2005  	ld	c,a		;c'= port base address
+0840  D9          2006  	exx
+                  2007  
+0841  CDA602      2008  	call	PRINTE		;print 'A' or 'B'
+                  2009  
+0844  CDFA03      2010  	call	ILPRNT		;Print this message
+0847  2C206174    2011  	db	', at',' '+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0053
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2013  ;Look up the baud rate in the baud rate table
+                  2014  ;and print it on the console
+                  2015  
+                  2016  ;table-look up setup for selected baud rate
+                  2017  
+084C  3A0307      2018  	ld	a,(BAUDRT)	;baud rate from user
+084F  E67F        2019  	and	7Fh		;remove default bit
+0851  47          2020  	ld	b,a
+0852  04          2021  	inc	b		;count down to 0
+0853  213D0D      2022  	ld	hl,BAUDTB	;baud rate table
+                  2023  
+0856  7E          2024  HUNTBD:	ld	a,(hl)		 ;80h at table start
+0857  23          2025  	inc	hl
+0858  87          2026  	add	a,a		;MSB set?
+0859  30FB        2027  	jr	NC,HUNTBD	;end of string?
+                  2028  
+                  2029  ;msb set. The next 2 are potential baud values
+                  2030  
+085B  5E          2031  	ld	e,(hl)		;potential TUBAUD val
+085C  23          2032  	inc	hl
+085D  56          2033  	ld	d,(hl)		;potential TUCTRL val
+085E  23          2034  	inc	hl		;hl points to string	
+                  2035  
+085F  10F5        2036  	djnz	HUNTBD		;skip to the entry
+                  2037  
+                  2038  ;d and e have the baud rate port values
+                  2039  ;hl points to the baud rate message
+                  2040  
+0861  CDE706      2041  	call	HLPRNT		;msb-term string at hl
+                  2042  
+0864  CDFA03      2043  	call	ILPRNT
+0867  20626175    2044  	db	' baud',CR,LF+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0054
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2046  ;----------------------------------------
+                  2047  ;Initialize the TU-ART port
+                  2048  ; c'= base address of the selected TU-ART
+                  2049  ;    port, which is its TUCTRL address
+                  2050  ; e = TUBAUD value
+                  2051  ; d = TUCTRL value
+                  2052  ;----------------------------------------
+086E  D5          2053  	push	de		;move de...
+086F  D9          2054  	exx			;alt regs
+0870  D1          2055  	pop	de		;..into alt regs de'
+                  2056  
+                  2057  ;reset the selected UART
+                  2058  
+0871  0C          2059  	inc	c
+0872  0C          2060  	inc	c		;point to TUCTRL
+0873  3E01        2061  	ld	a,TURST		;reset the UART
+0875  ED79        2062  	out	(c),a		;this bit non-latching
+                  2063  
+                  2064  ;disable UART interrupts
+                  2065  
+0877  0C          2066  	inc	c		;point to TUINTE
+0878  AF          2067  	xor	a,a		;disable all UART ints
+0879  ED79        2068  	out	(c),a
+                  2069  
+                  2070  ;set the high baud rate, according to 2nd table byte
+                  2071  
+087B  0D          2072  	dec	c		;point to TUCTRL
+087C  7A          2073  	ld	a,d		;set/clr high baud rate
+087D  ED79        2074  	out	(c),a
+                  2075  
+                  2076  ;set baud rate port according to 1st table byte
+                  2077  
+087F  0D          2078  	dec	c
+0880  0D          2079  	dec	c		;point to TBAUD
+0881  7B          2080  	ld	a,e		;baud rate table value
+0882  ED79        2081  	out	(c),a		;this bit non-latching
+                  2082  
+                  2083  ;eat up to 2 garbage chrs in the UART
+                  2084  
+0884  0C          2085  	inc	c
+0885  ED78        2086  	in	a,(c)		;eat garbage UART chrs
+0887  ED78        2087  	in	a,(c)
+0889  0D          2088  	dec	c
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0055
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2090  ;-------------------------------------------------
+                  2091  ;Test to see if the serial cable is connected and
+                  2092  ;clear hl' (the Xmodem block counter). (The TU-ART
+                  2093  ;will spew framing errors if not connected.)
+                  2094  ;(1 chr at 110 baud & 2 stop bits takes 100 mS.)
+                  2095  ; alt regs selected
+                  2096  ; c' = TU-ART port base address
+                  2097  ;-------------------------------------------------
+088A  21803E      2098  	ld	hl,16000	;Stall for about 100 mS
+                  2099  
+088D  2B          2100  STALUP:	dec	hl		;(6)
+088E  7C          2101  	ld	a,h		;(4)
+088F  B5          2102  	or	a,l		;(4)
+0890  20FB        2103  	jr	NZ,STALUP	;(12) 26 cycles=6.5 uS
+                  2104  
+0892  ED78        2105  	in	a,(c)		;read modem status
+                  2106  
+0894  E601        2107  	and	TUFE		;framing error?
+0896  C28F09      2108  	jp	NZ,CABERR
+                  2109  
+                  2110  ;ends with a=hl'=0
+                  2111  
+0899  D9          2112  	exx			;normal registers
+                  2113  				;..leaving hl'=0
+                  2114  
+                  2115  PS4:
+                  2116  ;------------------------------------------------
+                  2117  ;If the console is the transfer port and the user
+                  2118  ;has specified a buad rate, then inform the user
+                  2119  ;that the /B baud rate request will be ignored
+                  2120  ;------------------------------------------------
+089A  3A0307      2121  	ld	a,(BAUDRT)	;msb means default
+089D  87          2122  	add	a,a		;msb into carry
+089E  3820        2123  	jr	C,BAUDOK	;default: ok
+                  2124  
+08A0  3A0207      2125  	ld	a,(TPORT)	;is the transfer port
+08A3  FE43        2126  	cp	'C'		;..the console?
+08A5  2019        2127  	jr	NZ,BAUDOK	;n: /B is allowed
+                  2128  
+08A7  CDF703      2129  	call	CILPRT
+08AA  2F422069    2130  	db	'/B ignored for consol','e'+80h
+                  2131  BAUDOK:
+                  2132  ;--------------------------------------
+                  2133  ;Initialize some variables in registers
+                  2134  ;--------------------------------------
+08C0  AF          2135  	xor	a,a
+08C1  327C00      2136  	ld	(FCBREC),a	;FCB Record number=0
+08C4  326800      2137  	ld	(FCBEXT),a	;FCB Extent=0
+                  2138  
+08C7  DD210207    2139  	ld	ix,BUFFER	;ix is DMA address reg
+                  2140  ;---------------------------------
+                  2141  ;Calculate de=BUFFER+1024*(BKBYTS)
+                  2142  ; a = 0
+                  2143  ;---------------------------------
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0056
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+08CB  6F          2144  	ld	l,a	   ;0
+08CC  3A0407      2145  	ld	a,(BKBYTS)
+08CF  87          2146  	add	a	   ;*2
+08D0  87          2147  	add	a	   ;*4
+08D1  67          2148  	ld	h,a	   ;hl=BKBYTES*1024
+                  2149  
+08D2  110207      2150  	ld	de,BUFFER
+08D5  19          2151  	add	hl,de	   ;hl=BUFFER+BKBYTS*8
+                  2152  			   ;set Carry on overflow
+08D6  EB          2153  	ex	de,hl	   ;result to de
+                  2154  ;---------------------------------------------------
+                  2155  ;Calculate BUFMAX = the top of BUFFER memory: either
+                  2156  ;(CDOSA) or BUFFER+1024*(BKBYTS), whichever is less.
+                  2157  ; a = 0
+                  2158  ; de = potential BUFFER end
+                  2159  ; Carry set if BUFFER would overflow top of RAM
+                  2160  ;---------------------------------------------------
+08D7  2A0600      2161  	ld	hl,(CDOSA)	;beginning if CDOS
+                  2162  
+                  2163  ;Choose the smaller of de and hl
+                  2164  
+08DA  3805        2165  	jr	C,CCBM1		;overflow: use (CDOSA)
+                  2166  
+08DC  ED52        2167  	sbc	hl,de		;Carry set if de>hl
+08DE  3801        2168  	jr	C,CCBM1
+                  2169  
+08E0  EB          2170  	ex	de,hl		;NC: de was smaller
+                  2171  
+                  2172  ;remember the smaller address
+                  2173  	
+08E1  22FC06      2174  CCBM1:	ld	(BUFMAX),hl
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0057
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2176  ;--------------------------------------
+                  2177  ;If neither /R nor /S then ask the user
+                  2178  ; hl = (BUFMAX) = last BUFFER address+1
+                  2179  ;--------------------------------------
+08E4  3AFF06      2180  	ld	a,(XMODE)
+08E7  B7          2181  	or	a,a	   ;-1 means uninitialized
+08E8  F21209      2182  	jp	P,GOTDIR
+                  2183  
+08EB  CDF703      2184  ASKRS:	call	CILPRT
+08EE  53656E64    2185  	db	'Send or receive (S/R)?',' '+80h
+                  2186  
+0905  CD640C      2187  	call	GETANS
+                  2188  
+0908  D652        2189  	sub	a,'R'	   ;'R' and 'S' are adjacent
+090A  D602        2190  	sub	a,2	   ;'R' or 'S'?
+090C  30DD        2191  	jr	NC,ASKRS   ;n: try again
+                  2192  
+090E  2F          2193  	cpl		   ;0 for send, 1 for receive
+090F  32FF06      2194  	ld	(XMODE),a  ;update XMODE
+                  2195  GOTDIR:
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0058
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2197  ;----------------------------------------------------
+                  2198  ;Set up and jump to either RXFILE or TXFILE, based
+                  2199  ;on XMODE. If we are sending, then adjust BUFMAX
+                  2200  ;to be the start address of the last block in the
+                  2201  ;BUFFER by subtracting 128 from its value.
+                  2202  ; a = XMODE
+                  2203  ; hl = (BUFMAX) = last BUFFER address+1
+                  2204  ;----------------------------------------------------
+0912  B7          2205  	or	a,a	   ;0 means send
+0913  2016        2206  	jr	NZ,GDIRRX
+                  2207  ;------------------------------
+                  2208  ;Set up for TXFILE and go there
+                  2209  ;------------------------------
+0915  3EFF        2210  	ld	a,0FFh	   ;in case user typed /C
+0917  324300      2211  	ld	(SELCRC),a ;..undo it
+                  2212  
+091A  1180FF      2213  	ld	de,-BLKSIZ ;..beginning of the last
+091D  19          2214  	add	hl,de	   ;..BUFFER block
+091E  22FC06      2215  	ld	(BUFMAX),hl
+                  2216  
+0921  CD770C      2217  	call	FOPEN      ;Open file
+                  2218  			   ;& print message
+                  2219  			   ;returns NZ
+0924  FD212C01    2220  	ld	iy,WAITNK  ;RXBYT1 timeout address
+0928  C30901      2221  	jp	TXFILE     ;1 means transmit
+                  2222  ;---------------------------
+                  2223  ;Set up for RXFILE, initiate
+                  2224  ;transfer, and go to RXFILE
+                  2225  ;---------------------------
+092B  FD217E03    2226  GDIRRX:	ld	iy,RXBERR  ;Timeout return address
+                  2227  			   ;..for RXBYT1 & RXBYTE
+092F  CD9F0C      2228  	call	CREATE	   ;create, open disk file
+                  2229  ;--------------------------------------------
+                  2230  ;Set initial character to NAK or SELCRC, and
+                  2231  ;report error checking mode (checksum or CRC)
+                  2232  ;--------------------------------------------
+0932  21F906      2233  	ld	hl,NAKCHR
+                  2234  
+0935  3A0107      2235  	ld	a,(CRCFLG)	;CRC or checksum?
+0938  B7          2236  	or	a,a		;0 means checksum
+0939  2805        2237  	jr	Z,RXCSM
+                  2238  
+093B  3643        2239  	ld	(hl),SELCRC	;initial CRC NAK
+                  2240  
+093D  CDC806      2241  	call	PCRC		;print ' with CRC'
+                  2242  				;..rets with Z cleared
+                  2243  
+0940  CCD506      2244  RXCSM:	call	Z,PCKSUM	;' with checksums'
+                  2245  ;---------------------------------------------
+                  2246  ;If the console port is the transfer port then
+                  2247  ;stall for a few seconds to give the user time
+                  2248  ;to start the Xmodem send on the other end.
+                  2249  ; hl=NAKCHR
+                  2250  ;---------------------------------------------
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0059
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+0943  3A0207      2251  	ld	A,(TPORT) ;'C' means console
+0946  EE43        2252  	xor	'C'	  ;compare, clear carry
+0948  200A        2253  	jr	NZ,NOCRST
+                  2254  
+094A  11284B      2255  	ld	de,CRSTAL*1924
+                  2256  
+094D  10FE        2257  CRSTLP:	djnz	CRSTLP	  ;(2053)
+094F  1B          2258  	dec	de	  ;(6)
+0950  7A          2259  	ld	a,d	  ;(4)
+0951  B3          2260  	or	a,e	  ;(4) (clears carry)
+0952  20F9        2261  	jr	NZ,CRSTLP ;(12) 2079 cycles=519.75 uS
+                  2262  			  ;1924 passes per second
+                  2263  NOCRST:
+                  2264  ;--------------------------
+                  2265  ;Send initial NAK or SELCRC
+                  2266  ;to initiate the transfer
+                  2267  ; hl=NAKCHR
+                  2268  ; carry clear
+                  2269  ;--------------------------
+0954  7E          2270  	ld	a,(hl) 
+0955  CDB502      2271  	call	TXBYTE	   ;send the right chr
+                  2272  			   ;(does not affect carry)
+                  2273  
+0958  C36201      2274  	jp	RXFILE	   ;Go get the Xmodem file
+                  2275  			   ;..with carry clear
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0060
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2277  ;***INIT-Only Subroutine*************
+                  2278  ;Convert 1- or 2-digit decimal number
+                  2279  ;in de to a binary number in e
+                  2280  ;On Entry:
+                  2281  ;  de = 2 ASCII digits
+                  2282  ;On Exit:
+                  2283  ;  d = 0
+                  2284  ;  e = value of the digits
+                  2285  ;Rude exit to BADVAL on bad ASCII
+                  2286  ;Trashes a
+                  2287  ;*************************************
+095B  7B          2288  DEC2BN:	ld	a,e		;low digit
+095C  CD6F09      2289  	call	D2BDIG		;convert to binary
+095F  5F          2290  	ld	e,a		;low digit in binary
+                  2291  
+0960  7A          2292  	ld	a,d
+0961  B7          2293  	or	a,a		;single digit?
+0962  C8          2294  	ret	Z
+                  2295  
+0963  CD6F09      2296  	call	D2BDIG		;convert high digit
+                  2297  
+0966  87          2298  	add	a,a		;*2
+0967  87          2299  	add	a,a		;*4
+0968  82          2300  	add	a,d		;*5
+0969  87          2301  	add	a,a		;*10
+                  2302  
+096A  83          2303  	add	a,e		;combine digits
+096B  5F          2304  	ld	e,a		;result in e
+096C  1600        2305  	ld	d,0		;d=0 for ret
+096E  C9          2306  	ret
+                  2307  ;---Local Subroutine--------------
+                  2308  ;Convert digit from ASCII and test
+                  2309  ;---------------------------------
+096F  D630        2310  D2BDIG:	sub	a,'0'		;convert from ASCII
+0971  FE0A        2311  	cp	9+1
+0973  D8          2312  	ret	C		;Valid?
+                  2313  
+                  2314  ;Fall into BADVAL if invalid ASCII digit
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0061
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2316  ;--------------------------
+                  2317  ;Input-error exits. Print
+                  2318  ;message and return to CDOS
+                  2319  ;--------------------------
+0974  CD4202      2320  BADVAL:	call	CMSGXT
+0977  42616420    2321  	db	'Bad value for option /'
+098D  26          2322  PAR1:	db	'&'		;param goes here too
+098E  A0          2323  	db	' '+80h
+                  2324  
+098F  CD4202      2325  CABERR:	call	CMSGXT
+0992  4E6F2063    2326  	db	'No cable connecte','d'+80h
+                  2327  
+09A4  CD4202      2328  BADPAR:	call	CMSGXT
+09A7  496C6C65    2329  	db	'Illegal option: /'
+09B8  26          2330  PAR2:	db	'&'		;parameter goes here
+09B9  A0          2331  	db	' '+80h
+                  2332  
+09BA  CDF703      2333  BADINP:	call	CILPRT		;print this message
+09BD  487568BF    2334  	db	'Huh','?'+80h
+                  2335  
+                  2336  ;	Fall into HLPEXT
+                  2337  
+09C1  CD4202      2338  HLPEXT:	call	CMSGXT		;Exit w/ this message
+09C4  55736167    2339   db 'Usage: XMODEM <filename> {options}',CR,LF
+09E8  4F707469    2340   db 'Options:',CR,LF
+09F2  20202F42    2341   db '  /Bn sets the baud rate:',CR,LF
+0A0D  20202020    2342   db '    n=0:  110 baud      5: 4800 baud',CR,LF
+0A33  20202020    2343   db '      1:  150 baud      6: 9600 baud',CR,LF
+0A59  20202020    2344   db '      2:  300 baud      7: 19.2K baud',CR,LF
+0A80  20202020    2345   db '      3: 1200 baud      8: 38.4K baud'
+0AA5  20284465    2346   db ' (Default)', CR,LF
+0AB1  20202020    2347   db '      4: 2400 baud      9: 76.8K baud',CR,LF
+0AD8  20202F43    2348   db '  /C for checksum receive error-checking'
+0B00  20284465    2349   db ' (Default is CRCs)',CR,LF
+0B14  20202020    2350   db '     (Transmit error-checking mode is set'
+0B3D  20627920    2351   db ' by the receiver)',CR,LF
+0B50  20202F4B    2352   db '  /Knn sets the max k-bytes in the buffer'
+0B79  20284465    2353   db ' (Default=all free RAM)',CR,LF
+0B92  20202F51    2354   db '  /Q for quiet mode',CR,LF
+0BA7  20202F52    2355   db '  /R to receive',CR,LF
+0BB8  20202F53    2356   db '  /S to send',CR,LF
+0BC6  20202F54    2357   db '  /TA or /TB to use TU-ART port A (Default)'
+0BF1  206F7220    2358   db ' or port B',CR,LF
+0BFD  20202F54    2359   db '  /TC to use the console',CR,LF
+0C17  2B206D65    2360   db '+ means successful block transfer, '
+0C3A  2D206D65    2361   db '- means block retry',CR,LF+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0062
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2363  ;***INIT-Only Subroutine**************************
+                  2364  ;Skip over spaces in command line buffer until a
+                  2365  ;non-space character is found 
+                  2366  ;On Entry:
+                  2367  ;   b = remaining COMBUF byte count
+                  2368  ;   hl points to the next chr in COMBUF
+                  2369  ;On Exit:
+                  2370  ;   a = chr from COMBUF
+                  2371  ;   b has been decremented
+                  2372  ;   hl has been advanced
+                  2373  ;   Z set means end of buffer (and a is not valid)
+                  2374  ;*************************************************
+0C4F  CD5F0C      2375  SSKIP:	call	CMDCHR
+0C52  C8          2376  	ret	Z	  ;Z set for nothing left
+0C53  FE20        2377  	cp	a,' '	  ;white space?
+0C55  28F8        2378  	jr	Z,SSKIP
+0C57  C9          2379  	ret		  ;chr in a, Z clear
+                  2380  ;***INIT-Only Subroutine********************
+                  2381  ;Get a command parameter byte
+                  2382  ;On Entry:
+                  2383  ;  hl points to the next command line chr
+                  2384  ;On Exit:
+                  2385  ;  Z set if no more bytes in this parameter
+                  2386  ;  Z clear if another byte is present
+                  2387  ;  a = (hl)
+                  2388  ;  hl incremented if Z clear
+                  2389  ;******************************************
+0C58  7E          2390  CMDVAL:	ld	a,(hl)	;get buffer chr
+                  2391  
+0C59  FE20        2392  	cp	a,' '	;Space means end, but not error
+0C5B  C8          2393  	ret	Z	;space: go set a=0
+                  2394  
+0C5C  FE2F        2395  	cp	a,'/'	;Next one crammed agaist this?
+0C5E  C8          2396  	ret	Z	;no: got value
+                  2397  
+                  2398  ;Fall into CMDCHR to bump hl and return
+                  2399  ;or just return if null
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0063
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2401  ;***INIT-Only Subroutine***************************
+                  2402  ;Get next chr from 0-terminated command line buffer
+                  2403  ;On Entry:
+                  2404  ;   hl points to the next chr in COMBUF
+                  2405  ;On Exit:
+                  2406  ;   a = chr from COMBUF
+                  2407  ;   hl has been advanced unless end
+                  2408  ;   Z set means end of buffer, and a=0
+                  2409  ;   Carry = 0
+                  2410  ;**************************************************
+0C5F  7E          2411  CMDCHR:	ld	a,(hl)	  ;get buffer chr
+0C60  B7          2412  	or	a,a
+0C61  C8          2413  	ret	Z	  ;null termination?
+                  2414  
+0C62  23          2415  	inc	hl	  ;bump buffer pointer
+0C63  C9          2416  	ret		  ;with Z cleared
+                  2417  ;***INIT-Only Subroutine**********************
+                  2418  ;Get a 1-character response (with editing, CR,
+                  2419  ;and potential control-C) from the user
+                  2420  ;On Exit:
+                  2421  ;  a = uppercase response, if 1 chr typed
+                  2422  ;  a = FF for no characters typed
+                  2423  ;  a = 1-9 for 2-10 characters typed
+                  2424  ;      (definitelynot 'Y','N','R', or 'S')
+                  2425  ;Trashes c,de
+                  2426  ;*********************************************
+0C64  118000      2427  GETANS:	ld	de,COMBUF
+0C67  0E0A        2428  	ld	c,ILINEF  ;CDOS get line function
+0C69  79          2429  	ld	a,c	  ;also is reasonable max chrs
+0C6A  12          2430  	ld	(de),a	  ;tell CDOS the max
+0C6B  CD0500      2431  	call	CDOS	  ;returns chr count
+                  2432  
+0C6E  13          2433  	inc	de
+0C6F  1A          2434  	ld	a,(de)	  ;line chr count
+0C70  3D          2435  	dec	a	  ;just 1 chr?
+0C71  C0          2436  	ret	NZ	  ;n: error exit
+                  2437  
+0C72  13          2438  	inc	de
+0C73  1A          2439  	ld	a,(de)	  ;1st chr in the buffer
+                  2440  
+0C74  E6DF        2441  	and	a,['a'-'A'] xor 0FFh ;uppercase
+0C76  C9          2442  	ret
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0064
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2444  ;***INIT-Only Subroutine*****************************
+                  2445  ;Open CDOS disk file (for reading), and reports
+                  2446  ;success or failure to console.
+                  2447  ;On Entry:
+                  2448  ;  FCB has file name
+                  2449  ;On successful Exit:
+                  2450  ;  File is open
+                  2451  ;  File-open message has been printed on the console
+                  2452  ;  Z is cleared
+                  2453  ;On failure:
+                  2454  ;  Relevent error msg has been printed on the console
+                  2455  ;  jump to CDOS
+                  2456  ;****************************************************
+0C77  0E0F        2457  FOPEN:	ld	c,OPENF	  ;CDOS FILE OPEN function
+0C79  CDF103      2458  	call	CDOSFC
+0C7C  3C          2459  	inc	a	  ;-1 means open failure
+0C7D  280F        2460  	jr	Z,FOFAIL
+                  2461  
+0C7F  CDF703      2462  	call	CILPRT
+0C82  46696C65    2463  	db	'File open',CR,LF+80h
+                  2464  
+0C8D  C9          2465  	ret
+                  2466  ;-------------------
+                  2467  ;Error opening file:
+                  2468  ;Abort with message
+                  2469  ;-------------------
+0C8E  CD4502      2470  FOFAIL:	call	MSGXIT	;Exit w/ this message
+0C91  46696C65    2471  	db	'File not foun','d'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0065
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2473  ;***INIT-Only Subroutine*******************************
+                  2474  ;Create file on disk and report
+                  2475  ;On Entry:
+                  2476  ;  FCB has file name
+                  2477  ;On successful Exit:
+                  2478  ;  File is created and open
+                  2479  ;  File-created message has been printed on the console
+                  2480  ;On failure:
+                  2481  ;  Relevent error msg has been printed on the console
+                  2482  ;  jump to CDOS
+                  2483  ;******************************************************
+                  2484  ;---------------------------
+                  2485  ;See if file already exists,
+                  2486  ;and ask to overwrite if so
+                  2487  ;---------------------------
+0C9F  0E11        2488  CREATE:	ld	c,SRCHF	  ;Search directory for file
+0CA1  CDF103      2489  	call	CDOSFC
+0CA4  3C          2490  	inc	a	  ;-1 means not there
+0CA5  282B        2491  	jr	Z,FILNEX  ;error if so
+                  2492  
+0CA7  CDF703      2493  	call	CILPRT
+0CAA  46696C65    2494  	db	'File exists. Overwrite (Y/N)','?'+80h
+                  2495  
+0CC7  CD640C      2496  	call	GETANS	  ;Get 1-chr response
+0CCA  FE59        2497  	cp	'Y'
+0CCC  C24902      2498  	jp	NZ,EXIT
+                  2499  
+0CCF  CDEF03      2500  	call	FDELET	  ;delete existing file
+                  2501  ;-------------------------
+                  2502  ;Create file on CDOS disk
+                  2503  ;  de still points to FCB
+                  2504  ;-------------------------
+0CD2  CDF703      2505  FILNEX:	call	CILPRT		;either 'File created'
+                  2506  				;or 'File create error'
+0CD5  46696C65    2507  	db	'File creat','e'+80h
+                  2508  
+0CE0  0E16        2509  	ld	c,CREATF	;CDOS CREATE FILE func
+0CE2  CD0500      2510  	call	CDOS
+0CE5  3C          2511  	inc	a		;-1 means create error
+                  2512  
+0CE6  2811        2513  	jr	Z,FCERR
+                  2514  ;---------------------------
+                  2515  ;Tell user that we are ready
+                  2516  ;---------------------------
+0CE8  CDFA03      2517  	call	ILPRNT		;finish message
+                  2518  
+0CEB  64          2519  	db	'd'		;end of 'File created'
+0CEC  0D0A5265    2520  	db	CR,LF,'Receiving',' '+80h
+                  2521  
+0CF8  C9          2522  	ret
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0066
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2524  ;-------------------------
+                  2525  ;Error: File create failed
+                  2526  ;-------------------------
+0CF9  CD4502      2527  FCERR:	call	MSGXIT
+0CFC  20666169    2528       db ' fail. Write protect? Directory full','?'+80h
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0067
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2530  ;***INIT-only Table********************************
+                  2531  ;Command Line Options
+                  2532  ;Table entries must be in alphabetical order, and
+                  2533  ;terminated with 0FFH
+                  2534  ;
+                  2535  ;Each entry is 4 bytes long:
+                  2536  ; byte1 = uppercase legal option letter
+                  2537  ; byte2 = min legal value for this parameter
+                  2538  ;         MSB set means ASCII numbers
+                  2539  ; byte3 is the max range (Max-min) for this param+1
+                  2540  ; byte4 = variable table address offset
+                  2541  ;
+                  2542  ; if Byte2=0, then no parameters, and byte3 = value	
+                  2543  ;**************************************************
+                  2544  OPTTAB:
+                  2545  ;Baud Rate, 0-9
+0D21  42800904    2546  	db	'B',80h,9,[BAUDRT-VARTAB]
+                  2547  
+                  2548  ;CRC Rx error check mode: puts 0 in CRCFLG
+0D25  43000002    2549  	db	'C',0,0,[CRCFLG-VARTAB]
+                  2550  
+                  2551  ;Number of K-bytes in the BUFFER
+0D29  4B813F05    2552  	db	'K',81h,64-1,[BKBYTS-VARTAB]
+                  2553  
+                  2554  ;Quiet mode (no pacifiers, etc.)
+0D2D  5100FF01    2555  	db	'Q',0,0FFh,[PACCNT-VARTAB]
+                  2556  
+                  2557  ;Select receive mode: puts 1 in XMODE	
+0D31  52000100    2558  	db	'R',0,1,[XMODE-VARTAB]
+                  2559  
+                  2560  ;Select send mode: puts 0 in XMODE	
+0D35  53000000    2561  	db	'S',0,0,[XMODE-VARTAB]
+                  2562  
+                  2563  ;Transfer port: A=TU-ART port A, B=TU-ART port B
+                  2564  ;		C=Console port
+0D39  54410303    2565  	db	'T','A','C'-'A'+1,[TPORT-VARTAB]
+                  2566  
+                  2567  ;end-of-table marker is also the
+                  2568  ;FFh at the beginning of BAUDTB
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0068
+XMODEM 2.05 by Martin Eberhard
+Initialization Code, All Overwritten by BUFFER
+
+                  2570  ;***INIT-only Table***********************************
+                  2571  ;TU-ART Baud rate setup
+                  2572  ;Each entry has 3 components:
+                  2573  ; byte 1 = value for TU-ART baud rate register
+                  2574  ; byte 2 = value for TU-ART control register
+                  2575  ; bytes 3... = MSB-terminated text string
+                  2576  ;*****************************************************
+                  2577  BAUDTB:
+0D3D  FF          2578   db	0FFh			;beginning of table
+                  2579  
+0D3E  01003131    2580   db   01H,00H,'11','0'+80h	;0: 110 baud, 2 stops
+0D43  82003135    2581   db   82H,00H,'15','0'+80h	;1: 150 baud, 1 stop
+0D48  84003330    2582   db   84H,00H,'30','0'+80h	;2: 300 baud, 1 stop
+0D4D  88003132    2583   db   88H,00H,'120','0'+80h	;3: 1200 baud, 1 stop
+0D53  90003234    2584   db   90H,00H,'240','0'+80h	;4: 2400 baud, 1 stop
+0D59  A0003438    2585   db   0A0H,00H,'480','0'+80h	;5: 4800 baud, 1 stop
+0D5F  C0003936    2586   db   0C0H,00H,'960','0'+80h	;6: 9600 baud, 1 stop
+0D65  90103139    2587   db   090H,TUHBD,'19.2','K'+80h	;7: 19200 baud, 1 stop
+0D6C  A0103338    2588   db   0A0H,TUHBD,'38.4','K'+80h	;8: 38400 baud, 1 stop
+0D73  C0103736    2589   db   0C0H,TUHBD,'76.8','K'+80h	;9: 76800 baud, 1 stop
+                  2590  
+      (0D7A)      2591  CODEND	equ	$
+0D7A  (0000)      2592  	END
+
+Errors		   0
+Range Count	   1
+
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0069
+XMODEM 2.05 by Martin Eberhard
+Symbol	   Value  Defn  References
+
+ABORT      01C1   0498  1238
+ACK        0006   0247  0867 1226
+ACKERR     03D2   1246  0358 1233
+ACKTO      003C   0137  1222
+ASKRS      08EB   2184  2191
+BADINP     09BA   2333  1841 1844 1956
+BADPAR     09A4   2328  1885
+BADVAL     0974   2320  1924 1929
+BAUDOK     08C0   2131  2123 2127
+BAUDRT     0703   1776  2018 2121 2546
+BAUDTB     0D3D   2577  2022
+BKBYTS     0704   1778  2145 2552
+BLKORD     03A2   1191  1119
+BLKSIZ     0080   0140  0714 1044 1248 2213
+BOERR      03A9   1198  1193
+BUFCNT     06FA   1736  0360 0538 0550 0681 1124 1126 1545 1547 1592
+BUFFER     0702   1767  0552 0553 1501 1502 2139 2150
+BUFMAX     06FC   1737  1145 1542 2174 2215
+CAB1       01BE   0483  0480
+CABERR     098F   2325  2108
+CABORT     01B3   0475  0330 0643 0917 0962 1173 1198 1257
+CAN        0018   0251  0479 0927 1232
+CCBM1      08E1   2174  2165 2168
+CCTRLC     02C2   0902  0578 0822 1461
+CDOS       0005   0180  0181 0597 0840 0908 0912 1282 1527 2431 2510
+CDOSA      0006   0181  2161
+CDOSFC     03F1   1281  0430 0600 1532 2458 2489
+CDOSRE     0000   0179 
+CFAIL      0676   1620  0432
+CHK1       07C3   1915  1896
+CHK2       07D0   1929  1904
+CHK3       07D4   1937  1907
+CHKEOT     02F1   0936  0928
+CHKLUP     07AD   1878  1886
+CILPRT     03F7   1293  0415 0446 0498 0930 1612 1797 1965 2129 2184 2333 2462 2493 2505
+CLOSEF     0010   0165  0429
+CMDCHR     0C5F   2411  1821 1843 2375
+CMDVAL     0C58   2390  1856 1860
+CMSGXT     0242   0649  0443 1620 2320 2325 2328 2338
+CODEND     0D7A   2591 
+COMBUF     0080   0189  1810 2427
+CONINF     0001   0157  0911
+CONOTF     0002   0158  0839
+CONSTF     000B   0161  0907
+CR         000D   0249  0858 1613 1798 1804 2044 2339 2340 2341 2342 2343 2344 2346 2347 2349 2351 2353 2354 2355 2356 2358
+                        2359 2361 2463 2520
+CRCFLG     0701   1760  0759 1091 2235 2549
+CRCTAB     0400   1321  0731 1062
+CREATE     0C9F   2488  2228
+CREATF     0016   0174  2509
+CRSTAL     000A   0115  2255
+CRSTLP     094D   2257  2257 2261
+CTRLC      0003   0245  0914
+D2BDIG     096F   2310  2289 2296
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0070
+XMODEM 2.05 by Martin Eberhard
+Symbol	   Value  Defn  References
+
+DEC2BN     095B   2288  1915
+DECDIG     06B8   1660  1632 1634 1636 1638
+DEFBAUD    0008   0099  1776
+DEFBSIZ    003F   0111  1778
+DEFCHK     0001   0102 
+DEFPORT    0041   0105  1775
+DELETF     0013   0169  1269
+DIGLP      06BA   1662  1664
+DWERR      0230   0643  0608
+EOFLAG     06FE   1740  0396 0513 0625 0942 1497 1590
+EOT        0004   0246  0481 0933 0936 1606
+ERRCNT     06F8   1731  0684 0997 1169 1251
+ERRLIM     000A   0108  0683 0996 1174 1175 1175 1258 1259 1259
+EXIT       0249   0665  0506 2498
+FBEOF      0654   1590  1535
+FBLOOP     0632   1526  1574
+FCB        005C   0182  0183 0184 0185 0186 0187 0188 1281
+FCBDD      005C   0183 
+FCBEXT     0068   0186  2137
+FCBFN      005D   0184  1954
+FCBFT      0065   0185 
+FCBRCNT    006B   0187 
+FCBREC     007C   0188  2136
+FCERR      0CF9   2527  2513
+FDC16S     0000   0220  1980
+FDELET     03EF   1269  0438 2500
+FILBUF     0625   1497  0294 0363
+FILNEX     0CD2   2505  2491
+FLUSH      01DD   0538  0409 0517
+FOFAIL     0C8E   2470  2460
+FOPEN      0C77   2457  2217
+FSBAUD     0000   0232 
+FSCMD      0002   0236 
+FSDATA     0001   0234 
+FSFE       0001   0227 
+FSHBD      0010   0238 
+FSINTE     0003   0240 
+FSRBF      0040   0228 
+FSRST      0001   0237 
+FSSTAT     0000   0225 
+FSTBA      0080   0229 
+FSTBAB     0007   0230 
+GDIRRX     092B   2226  2206
+GETACK     03B7   1222  0774 1609
+GETANS     0C64   2427  2187 2496
+GOTDIR     0912   2195  2182
+GPCKSM     0146   0346  0324
+GPCRC      0141   0337  0321
+GTMODE     0121   0318  0326
+GV1        07A9   1864  1857 1861
+HLPEXT     09C1   2338  1814
+HLPRNT     06E7   1706  0502 0658 1306 2041
+HUNTBD     0856   2024  2027 2036
+ILINEF     000A   0160  2428
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0071
+XMODEM 2.05 by Martin Eberhard
+Symbol	   Value  Defn  References
+
+ILPRNT     03FA   1305  0297 0857 1684 1693 1988 1995 2010 2043 2517
+INIT       0705   1793  0261
+IPLOOP     06E9   1709  1716
+LF         000A   0248  0858 1613 1798 1804 2044 2339 2340 2341 2342 2343 2344 2346 2347 2349 2351 2353 2354 2355 2356 2358
+                        2359 2361 2463 2520
+MS500      0604   1438  1465
+MSGXIT     0245   0657  0460 2470 2527
+NAK        0015   0250  0323 1019 1732
+NAKCHR     06F9   1732  1020 1163 2233
+NAKTO      005A   0136  0314
+NOCRST     0954   2263  2253
+NOTSOH     02D9   0927  1009
+OPENF      000F   0163  2457
+OPTDON     07DE   1948  1822 1838
+OPTLP2     078C   1843  1825
+OPTLUP     0782   1837  1947
+OPTTAB     0D21   2544  1876
+PACACK     002B   0145  0790
+PACCNT     0700   1756  0309 0824 1986 2555
+PACERR     0297   0806  1160 1246
+PACIFY     0299   0822 
+PACLIN     0040   0147  0849
+PACNAK     002D   0146  0806
+PACNL      02AB   0849  0830
+PACOK      0294   0790  1134
+PAR1       098D   2322  1848
+PAR2       09B8   2330  1849
+PCKSUM     06D5   1693  0347 2244
+PCRC       06C8   1684  0338 2241
+PCRLF      02AD   0857  0649 1293
+PDEC16     069D   1629  0458
+PRGLUP     02FF   0956  0957
+PRINTE     02A6   0839  1676 1711 2008
+PRINTF     0009   0159 
+PS1        0828   1995  1973
+PS2        083E   2004  2000
+PS3        0801   1979 
+PS4        089A   2115  1991
+PURGE      02FD   0954  0937 1034
+RBPERX     0101   0128  1518 1557
+READF      0014   0170  1531
+RECSIZ     0080   0152  0602 1537
+REPCNT     01A5   0457  1616
+RFLUSH     0165   0409 
+RRXCNT     0199   0446  0436 0441
+RXBDIF     06F7   1729  1028 1115
+RXBERR     037E   1159  1107 2226
+RXBLK      030E   0996  0405 0633
+RXBYT1     0600   1406  0318 0956 1021 1030 1048 1095 1102
+RXBYTE     0602   1435  1006 1223
+RXCHR      0339   1048  1080
+RXCKSM     035B   1102  1093
+RXCSM      0940   2244  2237
+RXEND      016F   0429  0519
+CROMEMCO Z80 Macro Assembler version 03.10                                                                            Page 0072
+XMODEM 2.05 by Martin Eberhard
+Symbol	   Value  Defn  References
+
+RXFILE     0162   0405  2274
+RXLOOP     015B   0396  0411
+RXRTRY     0313   1003  1171
+RXWAIT     0607   1440  1456
+RXWAT1     0613   1453  1442
+SELCRC     0043   0252  0320 2211 2239
+SKPFIL     0775   1821  1828
+SOH        0001   0244  0694 1008
+SOHTO      000A   0135  1005
+SRCHF      0011   0167  2488
+SSKIP      0C4F   2375  1813 1837 2378
+STACK      0109   0267  1793
+STALUP     088D   2100  2103
+STDMAF     001A   0175  0596 1526
+TPAGER     0400   1318  1319
+TPORT      0702   1775  1969 2125 2251 2565
+TUARTA     0020   0195  1998
+TUARTB     0050   0196  2002
+TUBAUD     0000   0207 
+TUCTRL     0002   0211 
+TUDATA     0001   0209 
+TUFE       0001   0202  2107
+TUHBD      0010   0213  2587 2588 2589
+TUINTE     0003   0215 
+TURBF      0040   0203  1441
+TURST      0001   0212  2061
+TUSTAT     0000   0200 
+TUTBA      0080   0204 
+TUTBAB     0007   0205  0883
+TXACK      02B3   0867  0399 0632 0944
+TXBLK      024A   0680  0369
+TXBLUP     026A   0719  0751
+TXBYTE     02B5   0880  0483 0695 0700 0703 0720 0764 0768 1164 1607 2271
+TXCKSM     028B   0767  0761
+TXEOT      065D   1606  1499 1610
+TXFILE     0109   0294  2221
+TXLOOP     014E   0360  0371
+TXRTRY     0256   0694  0776
+TXWAIT     02B6   0882  0884
+USAREA     0100   0190  0260
+VARTAB     06FF   1747  1940 2546 2549 2552 2555 2558 2561 2565
+VERS       0205   0092  1801 1802 1802
+WAITNK     012C   0326  2220
+WBPERX     0040   0124  0572
+WFLOOP     01FC   0580  0622
+WFLP0      01F7   0572  0627 0637
+WFLP1      0206   0588  0583
+WRITEF     0015   0171  0599
+XMODE      06FF   1749  0434 0475 0545 0586 2180 2194 2558 2561
